@@ -1,0 +1,26 @@
+clients/read-guard-tool-lines.ts
+  s_2451845829bd42::t_66a1f76d57154d 494
+  s_2451845829bd42::t_e913d4b3189f1a 6-7,85-90,116-117,119-124,128,130,495-497,505-508
+  s_2451845829bd42::t_e0345886765a3a 83-84,91,97,104,109
+  s_2451845829bd42::t_ec1cbe23ca470a 115,118,125,127,133
+tests/clients/read-guard-tool-lines.test.ts
+  s_2451845829bd42::t_aacffbd19b54c7 1128-1209
+CHANGELOG.md
+  s_2451845829bd42::t_79ad88655e3a16 73-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.39-trip",
+  "base_commit_sha": "ec345364a00385c244dfb99e62390571aca230c9",
+  "prompts": {},
+  "sessions": {
+    "s_2451845829bd42": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019fc6ad-96be-74db-969a-2b1939a8361a",
+        "model": "claude-opus-5"
+      },
+      "human_author": "jiangmt <jiangmt@trip.com>"
+    }
+  }
+}
