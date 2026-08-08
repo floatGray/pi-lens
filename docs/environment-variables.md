@@ -213,6 +213,23 @@ misbehaves.
 Set to `1` for verbose installer/debug logging (same as `--debug`). Off by
 default.
 
+### `PI_LENS_DEBUG_HANDLES`
+
+Set to `1` **before starting pi** to enable the handle-origin tracer
+(institutionalized from the #1097 hand-rolled `async_hooks` investigation
+that root-caused a leaked `setTimeout` keeping a `--print --no-session`
+process alive). Read once at extension load — toggling it mid-session has no
+effect. When set, pi-lens dumps `process.getActiveResourcesInfo()` counts by
+resource type (plus per-type creation-site stack attribution, since the
+`async_hooks` tracker only installs when the flag was already on at startup)
+to `~/.pi-lens/debug-handles.log` at two points: `agent_settled` (after
+quiet-window work is scheduled) and `session_shutdown` (after teardown —
+whatever is still alive at that point is the leak). Off by default, and a
+true no-op when unset — no writer, no `async_hooks` hook, zero overhead. Use
+it to diagnose a pi process that won't exit: run once with the flag set,
+reproduce the hang, then check `debug-handles.log`'s `session_shutdown`
+entry for what's still holding the loop open.
+
 ### `PI_LENS_LOG_RETENTION_DAYS`
 
 Days to keep rotated logs before cleanup. **Default:** `7`.

@@ -86,6 +86,12 @@ jobs:
           # Spawn-heavy MCP smokes retain a 20s local deadline but need room
           # for loaded shared runners (#860).
           PI_LENS_TEST_TIMEOUT_SCALE: '3'
+          # The #1101 machine-wide test-suite lock (scripts/with-test-lock.mjs)
+          # exists to serialize concurrent full-suite runs on a SHARED dev
+          # machine. CI runners are isolated (one job per VM), so there is
+          # never contention to serialize — skip it explicitly rather than
+          # relying on it being harmless.
+          PI_LENS_TEST_NO_LOCK: '1'
         run: npm test
 
   # Simulates pi's real install path: a `git:` install runs `npm install

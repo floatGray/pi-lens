@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL, URL } from "node:url";
 import {
 	getProjectIgnoreMatcher,
 	isExcludedDirName,
@@ -32,7 +33,20 @@ import type {
 	LSPClientInfo,
 	LSPShutdownOptions,
 } from "./client.js";
+import {
+	recordLspMutation,
+	type LspMutationContext,
+} from "../lsp-mutation.js";
 import { createLSPClient } from "./client.js";
+import {
+	bindingStateLabel,
+	composeBoundToCurrentDisk,
+	createDiskBindingCache,
+	type BoundToCurrentDisk,
+	type DiagnosticBinding,
+	type DiskBindingCache,
+	type StoredDiagnosticBinding,
+} from "./diagnostic-binding.js";
 import { getServersForFileWithConfig, getServerInitOverride } from "./config.js";
 import { getLanguageId } from "./language.js";
 import type { LSPServerInfo } from "./server.js";
@@ -52,6 +66,7 @@ import {
 	applyWorkspaceEdit,
 	mergeWorkspaceTextEditsByPriority,
 	summarizeWorkspaceEdit,
+	validateWorkspaceEdit,
 } from "./edits.js";
 import {
 	buildScopeKey,
@@ -64,6 +79,51 @@ import {
 	isWarmAttached,
 	tryWarmAttachedDiagnostics,
 } from "../warm-attach.js";
+
+function destinationUriPreservingSpelling(
+	oldUri: string,
+	oldFilePath: string,
+	newFilePath: string,
+): string {
+	const canonical = pathToFileURL(newFilePath);
+	try {
+		const original = new URL(oldUri);
+		const authority = /^file:\/\/([^/]*)/i.exec(oldUri)?.[1] ?? "";
+		if (
+			original.protocol !== "file:" ||
+			(original.host !== "" && original.hostname !== "localhost")
+		) {
+			return canonical.href;
+		}
+		const canonicalDestination = () =>
+			`${original.protocol}//${authority}${canonical.pathname}`;
+		const oldParent = path.resolve(path.dirname(oldFilePath));
+		const newParent = path.resolve(path.dirname(newFilePath));
+		if (normalizeMapKey(oldParent) !== normalizeMapKey(newParent)) {
+			return canonicalDestination();
+		}
+		const slash = original.pathname.lastIndexOf("/");
+		if (slash < 0) return canonicalDestination();
+		let rawName = canonical.pathname.slice(canonical.pathname.lastIndexOf("/") + 1);
+		const oldRawName = original.pathname.slice(slash + 1);
+		const oldName = decodeURIComponent(oldRawName);
+		const expectedOldName = path.basename(oldFilePath);
+		if (oldName.toLowerCase() !== expectedOldName.toLowerCase()) {
+			return canonicalDestination();
+		}
+		// Keep non-canonical percent-encoding choices from the URI that was
+		// opened (for example `%2E` instead of `.`) while using the new path's
+		// exact basename. The authority and directory spelling are preserved too.
+		for (const match of oldRawName.matchAll(/%([0-9a-f]{2})/gi)) {
+			const encoded = match[0];
+			const decoded = String.fromCharCode(Number.parseInt(match[1], 16));
+			rawName = rawName.split(decoded).join(encoded);
+		}
+		return `${original.protocol}//${authority}${original.pathname.slice(0, slash + 1)}${rawName}`;
+	} catch {
+		return canonical.href;
+	}
+}
 
 // --- Init override helpers ---
 
@@ -149,6 +209,12 @@ export interface LSPState {
 const BROKEN_BASE_COOLDOWN_MS = 15_000;
 const BROKEN_MAX_COOLDOWN_MS = 5 * 60_000; // cap at 5 minutes
 const BROKEN_PERMANENT_AFTER = 5; // disable for session after N consecutive failures
+// #1127: a client that dies THIS soon after a successful spawn/initialize is
+// treated as a crash-loop symptom (opengrep's post-init "Unhandled message"
+// exit), not a legitimate long-running server that happened to restart once.
+// 60s comfortably covers normal serve-a-few-files-then-idle sessions while
+// still catching "spawns fine, dies within seconds every time" servers.
+const RUNTIME_EXIT_UPTIME_THRESHOLD_MS = 60_000;
 // #743: a server whose per-server notify write (didOpen/didChange) times out
 // this many times in a row is a persistently backpressured server; it is demoted
 // into the `broken` cooldown map (evicted + cooled down) so subsequent sweeps
@@ -432,6 +498,16 @@ export interface LSPWorkspaceDiagnosticResult {
 	 * reads honestly as "skipped after failed warm-up" rather than "ran clean".
 	 */
 	skippedWarmupFailure?: boolean;
+	/**
+	 * #1093: wall-clock time (ms) these diagnostics were actually OBSERVED, set
+	 * ONLY for results served from the workspace-diagnostics cache (a replay of
+	 * an older scan). Absent for freshly-touched results (observed now). Callers
+	 * reconciling this into the footer widget must pass it as the `observedAt`
+	 * stamp so a cache-hit replay doesn't re-arm the mtime-staleness gate
+	 * (`reconcileStaleWidgetFiles`) and keep a resolved finding on screen (the
+	 * #1092 touchedAt-re-arming defect).
+	 */
+	observedAt?: number;
 }
 
 /**
@@ -575,7 +651,7 @@ const WORKSPACE_SWEEP_PREOPEN_CHUNK_SIZE = (() => {
 })();
 
 // #584: opengrep has no `workspace/diagnostic` pull support (push-only,
-// docs/servercapabilities.md) and `reopenOnResync: true` (server-strategies.ts)
+// docs/servercapabilities.md) and `reopenOnResync: true` (wait-policy/strategies.ts)
 // means every per-file LSP touch already forces a full re-scan anyway — there's
 // no incremental win from routing it through the sweep's per-file loop. On a
 // full workspace sweep it instead dominates the per-file wait (its own
@@ -700,6 +776,21 @@ export class LSPService {
 	private readonly optionalDisabled = new Set<string>();
 	/** Consecutive failure counts for exponential backoff circuit breaker */
 	private readonly failureCounts = new Map<string, number>();
+	/**
+	 * #1127: consecutive EARLY post-init runtime exits — a client that closed
+	 * unexpectedly (not via our own `shutdown()`) with an uptime under
+	 * {@link RUNTIME_EXIT_UPTIME_THRESHOLD_MS}. Tracked separately from
+	 * {@link failureCounts} because a successful spawn/initialize clears that
+	 * map (correct for the spawn/init failure class it was built for — see
+	 * `spawnClient`'s success path) but is exactly the event a crash-loop
+	 * server keeps producing right before it dies again; reusing the same map
+	 * would make every respawn erase the streak the moment it re-spawned,
+	 * which is the #1127 bug. This counter shares the SAME cooldown formula,
+	 * the SAME `state.broken`/`permanentlyBroken` maps, and the SAME
+	 * give-up-after-N-failures threshold as the spawn/init breaker — it is a
+	 * parallel counter feeding one circuit, not a second mechanism.
+	 */
+	private readonly runtimeExitCounts = new Map<string, number>();
 	/** Server/root keys disabled for the rest of this session after repeated failures. */
 	private readonly permanentlyBroken = new Set<string>();
 	/**
@@ -721,6 +812,13 @@ export class LSPService {
 	 * those falls through to a fresh check rather than serving a stale result.
 	 */
 	private readonly lastKnownContentHash = new Map<string, string>();
+	/**
+	 * #1095: lazily verifies a stored {@link DiagnosticBinding} against current
+	 * disk bytes, memoizing the disk fingerprint per (file, mtime) so repeated
+	 * binding reads across `touchFile`/`getAllDiagnostics` within a session don't
+	 * re-hash unchanged files. Owned by the service so the memo is shared.
+	 */
+	private readonly diskBindingCache: DiskBindingCache = createDiskBindingCache();
 	private readonly lastDiagnosticsHealth = new Map<
 		string,
 		LSPDiagnosticsHealth
@@ -1009,14 +1107,34 @@ export class LSPService {
 		}
 
 		const timeoutSentinel = Symbol("lsp-client-wait-timeout");
-		const waitResult = await Promise.race<
-			SpawnedServer | undefined | typeof timeoutSentinel
-		>([
-			withBudget(),
-			new Promise<typeof timeoutSentinel>((resolve) =>
-				setTimeout(() => resolve(timeoutSentinel), effectiveMaxWaitMs),
-			),
-		]);
+		// #1097: store the timer and clear it once the race settles. Without this,
+		// when `withBudget()` wins (the common case: the client is ready well before
+		// the budget), the losing `setTimeout` stays a REF'D pending timer for the
+		// full remaining `effectiveMaxWaitMs`. In a long-lived interactive session
+		// that is invisible (it fires later, resolves an orphan promise, is GC'd).
+		// In a one-shot `pi --print --no-session` process it is fatal: the timer
+		// keeps the event loop alive for up to `effectiveMaxWaitMs` after
+		// `agent_settled`/`session_shutdown`, so the completed process never exits
+		// (issue #1097 — a recurrence of the #22 symptom via a different handle, and
+		// a member of the uncleared-race-timeout class the shared `withDeadline`
+		// helper already guards against elsewhere).
+		let waitTimer: ReturnType<typeof setTimeout> | undefined;
+		let waitResult: SpawnedServer | undefined | typeof timeoutSentinel;
+		try {
+			waitResult = await Promise.race<
+				SpawnedServer | undefined | typeof timeoutSentinel
+			>([
+				withBudget(),
+				new Promise<typeof timeoutSentinel>((resolve) => {
+					waitTimer = setTimeout(
+						() => resolve(timeoutSentinel),
+						effectiveMaxWaitMs,
+					);
+				}),
+			]);
+		} finally {
+			if (waitTimer) clearTimeout(waitTimer);
+		}
 
 		if (waitResult === timeoutSentinel) {
 			// Snapshot known client health — scan by serverId prefix (no root needed)
@@ -1205,6 +1323,29 @@ export class LSPService {
 			}
 			// Dead client — was previously alive, now needs respawn
 			const spawnedAt = this.state.clientSpawnedAt.get(key);
+			// #1127: capture BEFORE calling existing.shutdown() below — both
+			// wasShutdownIntentional() and getExitedAt() read state that
+			// existing.shutdown() itself mutates as a side effect of our own
+			// cleanup (shutdownRequested flips true, and the process exit it
+			// triggers would stamp exitedAt at CLEANUP time rather than at the
+			// real death), so both must be read before that call.
+			const wasIntentional = existing.wasShutdownIntentional();
+			const exitedAt = existing.getExitedAt();
+			// #1127: lifetime MUST be measured from the client's own recorded
+			// death (exitedAt), not from "now" (this detection). Detection is
+			// lazy — the next file attach — and #1127's real-world pattern is
+			// attach-triggered respawns minutes to HOURS apart: a server that
+			// died 5s after spawning but wasn't detected until an hour later
+			// must still read as an early, breaker-worthy exit. Fall back to the
+			// detection-time delta only when exitedAt is somehow unset (the
+			// client's own exit handlers always set it before isAlive() can go
+			// false, so this is a defensive fallback, not the expected path).
+			const uptimeMs =
+				exitedAt != null && spawnedAt != null
+					? exitedAt - spawnedAt
+					: spawnedAt != null
+						? Date.now() - spawnedAt
+						: null;
 			logLatency({
 				type: "phase",
 				phase: "lsp_server_respawn",
@@ -1213,7 +1354,8 @@ export class LSPService {
 				metadata: {
 					serverId: server.id,
 					root,
-					uptimeMs: spawnedAt != null ? Date.now() - spawnedAt : null,
+					uptimeMs,
+					intentional: wasIntentional,
 				},
 			});
 			try {
@@ -1224,6 +1366,50 @@ export class LSPService {
 			this.state.clients.delete(key);
 			this.state.clientSpawnedAt.delete(key);
 			this.state.broken.delete(key);
+
+			// #1127: count EARLY, non-intentional runtime exits toward the circuit
+			// breaker. Spawn/initialize itself succeeded here (this client made it
+			// into state.clients), so `failureCounts` — the spawn/init breaker —
+			// never saw this failure and was cleared to 0 on that earlier success.
+			// Without this, a server that spawns fine and then dies shortly after
+			// serving (opengrep's post-init "Unhandled message" crash, #1122/#1127)
+			// respawns forever: cooldown/permanent-disable never engage.
+			//
+			// Deliberate teardowns (session reset, #743 notify-backpressure
+			// eviction, a generation handoff) call `shutdown()` themselves and set
+			// `shutdownRequested` before the process exits — those must never count,
+			// or a legitimate restart would wrongly march the server toward
+			// permanent disablement.
+			if (wasIntentional) {
+				// Not evidence of a bad server — leave any existing runtime-exit
+				// streak alone (a deliberate restart is not a recovery signal
+				// either; only clear the streak once the server proves itself by
+				// staying up past the threshold, handled in the `else` below).
+			} else if (uptimeMs != null && uptimeMs < RUNTIME_EXIT_UPTIME_THRESHOLD_MS) {
+				const rCount = (this.runtimeExitCounts.get(key) ?? 0) + 1;
+				this.runtimeExitCounts.set(key, rCount);
+				const rCooldown = Math.min(
+					BROKEN_BASE_COOLDOWN_MS * 2 ** (rCount - 1),
+					BROKEN_MAX_COOLDOWN_MS,
+				);
+				this.state.broken.set(key, Date.now() + rCooldown);
+				if (!isOptionalServer && rCount >= BROKEN_PERMANENT_AFTER) {
+					this.permanentlyBroken.add(key);
+					logSessionStart(
+						`lsp respawn ${server.id}: permanently disabled after ${rCount} early post-init exits (uptimeMs=${uptimeMs})`,
+					);
+				} else {
+					logSessionStart(
+						`lsp respawn ${server.id}: early post-init exit ${rCount}/${BROKEN_PERMANENT_AFTER} (uptimeMs=${uptimeMs}), cooldown=${rCooldown}ms`,
+					);
+				}
+			} else {
+				// Survived past the threshold (or uptime unknown) before dying —
+				// this was a functioning server, not a crash loop. Reset the streak
+				// so an occasional post-longrun crash doesn't creep it toward
+				// permanent disablement.
+				this.runtimeExitCounts.delete(key);
+			}
 		}
 
 		const brokenUntil = this.state.broken.get(key);
@@ -1489,6 +1675,18 @@ export class LSPService {
 				 * bonus field, not a shape change).
 				 */
 				inconclusive?: boolean;
+				/**
+				 * #1095: content binding of the merged result — {version?,
+				 * contentHash?, boundToCurrentDisk} answering "were these
+				 * diagnostics computed against what's on disk now?" composed across
+				 * every contributing client. `boundToCurrentDisk === false` means
+				 * the server's view diverged from disk (a stale-but-fresh-looking
+				 * result); consumers must demote such a result to inconclusive
+				 * rather than trust it. "unknown" (version-less server, or disk
+				 * unreadable) preserves pre-#1095 behavior. Non-enumerable, like
+				 * `inconclusive`.
+				 */
+				binding?: DiagnosticBinding;
 			})
 		| undefined
 	> {
@@ -1679,7 +1877,7 @@ export class LSPService {
 		if (diagnosticsMode !== "none") {
 			// Resolution: env wins so users can tune the cap without rebuilding.
 			// Otherwise, on the single-server hot path (primary scope), use that
-			// server's own strategy budget (server-strategies.ts) so a fast server
+			// server's own strategy budget (wait-policy/strategies.ts) so a fast server
 			// (TypeScript ~1s) isn't held to a flat multi-second wait while a slow
 			// one (rust-analyzer 3s) gets the time it needs — bounded by any caller
 			// ceiling that exists to protect the per-edit pipeline budget (#203).
@@ -2179,6 +2377,15 @@ export class LSPService {
 						spawned.flatMap((entry) => entry.client.getDiagnostics(filePath)),
 					)
 			: undefined;
+		// #1095 (P3-b): whether `collected` came from a tsserver sync confirm
+		// (`tsserverSyncRequest`) rather than the publish cache. A sync-confirmed
+		// result is authoritative for the CURRENT buffer but is NOT tied to the
+		// publish-path content binding (`diagnosticBindings`, set on publish), so
+		// composing that binding here could let a STALE publish fingerprint demote a
+		// genuinely-fresh sync answer to `false`. The end-of-wait fallback below can
+		// also set this. When true, the binding is surfaced as "unknown" (honest,
+		// non-demoting) rather than the stale publish binding.
+		let syncConfirmed = tsserverSyncConfirmed !== undefined;
 
 		// #707 end-of-wait fallback: when the racing confirm did NOT decide the
 		// wait (sync unavailable/failed mid-race, or push resolved as a bare
@@ -2210,6 +2417,7 @@ export class LSPService {
 					// Sync answered — confirmed result (clean or with diagnostics).
 					// Clear the timed-out flag so the touch is no longer inconclusive.
 					diagnosticsTimedOut = false;
+					syncConfirmed = true;
 					collected = syncResult.length > 0
 						? mergeLspDiagnostics(syncResult)
 						: [];
@@ -2362,6 +2570,34 @@ export class LSPService {
 			});
 		}
 
+		// #1095: attach the merged content binding (non-enumerable, like
+		// `inconclusive`) so a consumer can ask whether these diagnostics were
+		// computed against current disk. Composed across every spawned client so a
+		// single client whose view diverged from disk marks the whole merged result
+		// mismatched. Disk verify is lazy + memoized per (file, mtime).
+		let binding: DiagnosticBinding | undefined;
+		if (collected !== undefined) {
+			binding = syncConfirmed
+				? // #1095 (P3-b): a tsserver sync-confirmed result is authoritative for
+					// the current buffer but not tied to the publish-path fingerprint —
+					// surface "unknown" so a stale publish binding can't demote it.
+					{ boundToCurrentDisk: "unknown" }
+				: this.mergeBinding(
+						filePath,
+						// Optional-chain so a client without the getter (test doubles, a
+						// partially-mocked client) yields "unknown" rather than throwing —
+						// unknown preserves pre-#1095 behavior for that contributor.
+						spawned.map((entry) =>
+							entry.client.getDiagnosticBinding?.(filePath),
+						),
+					);
+			Object.defineProperty(collected, "binding", {
+				value: binding,
+				enumerable: false,
+				configurable: true,
+			});
+		}
+
 		// Only refresh the recent-touches entry when we actually pushed. Skipping
 		// here keeps the original push timestamp intact so the debounce window
 		// expires naturally instead of being extended by every reuse.
@@ -2381,6 +2617,13 @@ export class LSPService {
 				source,
 				failureKind: "success",
 				collectedDiagnostics: collected?.length,
+				// #1095: observability so an unbinding server is diagnosable —
+				// "bound" (matches disk) / "mismatch" (diverged) / "unknown"
+				// (version-less server or disk unreadable). Absent for non-collecting
+				// touches (no merged result to bind).
+				...(binding !== undefined && {
+					bindingState: bindingStateLabel(binding.boundToCurrentDisk),
+				}),
 				notifySkipped,
 				notifyWriteTimedOut,
 				// #743: per-server detail — which servers' writes actually timed out.
@@ -2665,6 +2908,39 @@ export class LSPService {
 	}
 
 	/**
+	 * #1095: compose the content `binding` for a merged diagnostics result across
+	 * the clients that contributed to it (primary + any auxiliaries). Verifies
+	 * each contributor's stored binding against current disk lazily (memoized per
+	 * file+mtime by {@link diskBindingCache}) and composes per
+	 * {@link composeBoundToCurrentDisk}: ANY contributor mismatches disk → false;
+	 * else all "unknown" (or no contributors) → "unknown"; else true. The
+	 * surfaced version/contentHash come from the first contributor that carries
+	 * them — informational only; the load-bearing field is `boundToCurrentDisk`.
+	 */
+	private mergeBinding(
+		filePath: string,
+		stored: readonly (StoredDiagnosticBinding | undefined)[],
+	): DiagnosticBinding {
+		const verdicts: BoundToCurrentDisk[] = [];
+		let version: number | undefined;
+		let contentHash: string | undefined;
+		for (const entry of stored) {
+			verdicts.push(
+				this.diskBindingCache.boundToCurrentDisk(filePath, entry ?? {}),
+			);
+			if (version === undefined && entry?.version !== undefined) {
+				version = entry.version;
+				contentHash = entry.contentHash;
+			}
+		}
+		return {
+			version,
+			contentHash,
+			boundToCurrentDisk: composeBoundToCurrentDisk(verdicts),
+		};
+	}
+
+	/**
 	 * Navigation: go to definition
 	 */
 	async definition(filePath: string, line: number, character: number) {
@@ -2803,6 +3079,7 @@ export class LSPService {
 		filePath: string | undefined,
 		command: string,
 		args?: unknown[],
+		mutationContext?: LspMutationContext,
 	): Promise<{ executed: boolean; result?: unknown; reason?: string }> {
 		if (filePath) {
 			const spawned = await this.getClientForFile(
@@ -2812,11 +3089,11 @@ export class LSPService {
 			if (!spawned) {
 				return { executed: false, reason: "no LSP server for file" };
 			}
-			return spawned.client.executeCommand(command, args);
+			return spawned.client.executeCommand(command, args, mutationContext);
 		}
 		const first = this.state.clients.values().next().value;
 		if (!first) return { executed: false, reason: "no active LSP server" };
-		return first.executeCommand(command, args);
+		return first.executeCommand(command, args, mutationContext);
 	}
 
 	/**
@@ -2952,10 +3229,27 @@ export class LSPService {
 	async renameFile(
 		oldFilePath: string,
 		newFilePath: string,
-		options: { cwd: string; apply?: boolean },
+		options: { cwd: string; apply?: boolean; mutationContext?: LspMutationContext },
 	): Promise<LSPRenameFileResult> {
 		const cwd = options.cwd;
 		const apply = options.apply ?? false;
+		// Validate the complete resource operation before asking any server for
+		// willRenameFiles edits. This is a read-only preflight, but it reuses the
+		// same confinement, realpath/symlink, existence, and destination checks as
+		// the eventual apply path, so an invalid rename cannot first mutate an
+		// in-workspace file through returned text edits (including previews).
+		await validateWorkspaceEdit(
+			{
+				documentChanges: [
+					{
+						kind: "rename",
+						oldUri: pathToFileURL(oldFilePath).href,
+						newUri: pathToFileURL(newFilePath).href,
+					},
+				],
+			},
+			cwd,
+		);
 		const priorityServerIds = getServersForFileWithConfig(oldFilePath).map(
 			(server) => server.id,
 		);
@@ -3006,9 +3300,99 @@ export class LSPService {
 			};
 		}
 
-		const applied = await applyWorkspaceEdit(merged.edit, cwd);
-		await fs.mkdir(path.dirname(newFilePath), { recursive: true });
-		await fs.rename(oldFilePath, newFilePath);
+		let applied;
+		try {
+			applied = await applyWorkspaceEdit(merged.edit, cwd, {
+				mutationContext: options.mutationContext,
+				observe: false,
+			});
+		} catch (err) {
+			if (options.mutationContext) {
+				const partial = (err as { appliedWorkspaceEdit?: typeof applied })
+					.appliedWorkspaceEdit;
+				if (partial) {
+					recordLspMutation(options.mutationContext, {
+						results: [partial],
+						status: "failed",
+					});
+				}
+			}
+			throw err;
+		}
+		const openDocuments = activeClients
+			.filter(({ client }) => client.isDocumentOpen(oldFilePath))
+			.map(({ serverId, client }) => ({
+				serverId,
+				client,
+				oldUri: client.getDocumentUri(oldFilePath),
+			}));
+		const closeFailures: Array<{ serverId: string; error: string }> = [];
+		await Promise.all(
+			openDocuments.map(async ({ serverId, client }) => {
+				try {
+					await client.closeDocument(oldFilePath);
+					return undefined;
+				} catch (err) {
+					closeFailures.push({
+						serverId,
+						error: err instanceof Error ? err.message : String(err),
+					});
+					return undefined;
+				}
+			}),
+		);
+		if (closeFailures.length > 0) {
+			if (options.mutationContext) {
+				recordLspMutation(options.mutationContext, {
+					results: [applied],
+					status: "failed",
+				});
+			}
+			// Do not rename or send didRenameFiles while any server still has the
+			// old document open. Re-open/resync every affected client so a partial
+			// close cannot leave an in-memory document behind the disk contents.
+			// Reopen with the document's ACTUAL language ID (the same resolver every
+			// genuine open uses) rather than a hardcoded "plaintext" fallback — a
+			// wrong languageId here degrades that server's diagnostics until the
+			// next genuine open (#1147 P3-7).
+			const content = await fs.readFile(oldFilePath, "utf-8");
+			const languageId = getLanguageId(oldFilePath) ?? "plaintext";
+			await Promise.all(
+				openDocuments.map(({ client }) =>
+					client.notify.open(oldFilePath, content, languageId, true, true),
+				),
+			);
+			throw new Error(
+				`workspace/didClose failed; rename aborted: ${closeFailures.map((failure) => `${failure.serverId}: ${failure.error}`).join("; ")}`,
+			);
+		}
+		let renameApplied;
+		try {
+			// Route the resource mutation through the same preflight confinement,
+			// realpath and symlink policy as all other workspace edits. Do not
+			// duplicate that security boundary with a direct mkdir/rename pair.
+			renameApplied = await applyWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: pathToFileURL(oldFilePath).href,
+							newUri: pathToFileURL(newFilePath).href,
+						},
+					],
+				},
+				cwd,
+				{ observe: false },
+			);
+		} catch (err) {
+			if (options.mutationContext) {
+				recordLspMutation(options.mutationContext, {
+					results: [applied],
+					status: "failed",
+				});
+			}
+			throw err;
+		}
 		const relOld =
 			path.relative(cwd, oldFilePath).replace(/\\/g, "/") ||
 			path.basename(oldFilePath);
@@ -3019,16 +3403,63 @@ export class LSPService {
 
 		await Promise.all(
 			activeClients.map(async ({ serverId, client }) => {
+				const opened = openDocuments.find((entry) => entry.serverId === serverId);
 				try {
-					await client.didRenameFiles(oldFilePath, newFilePath);
+					if (opened?.oldUri) {
+						await client.didRenameFiles(
+							oldFilePath,
+							newFilePath,
+							opened.oldUri,
+							destinationUriPreservingSpelling(
+								opened.oldUri,
+								oldFilePath,
+								newFilePath,
+							),
+						);
+					} else {
+						await client.didRenameFiles(oldFilePath, newFilePath);
+					}
+					return undefined;
 				} catch (err) {
 					didRenameFailures.push({
 						serverId,
 						error: err instanceof Error ? err.message : String(err),
 					});
+					return undefined;
 				}
 			}),
 		);
+
+		const files = [...new Set([...applied.files, oldFilePath, newFilePath])];
+		if (options.mutationContext) {
+			recordLspMutation(options.mutationContext, {
+				results: [
+					{
+						...applied,
+						files,
+						operationTotal: applied.operationTotal + renameApplied.operationTotal,
+						appliedOperationTotal: applied.appliedOperationTotal + renameApplied.appliedOperationTotal,
+						appliedOperationIndexes: [
+							...applied.appliedOperationIndexes,
+							...renameApplied.appliedOperationIndexes.map(
+								(index) => applied.operationTotal + index,
+							),
+						],
+						operationCounts: {
+							textEdits: applied.operationCounts.textEdits + renameApplied.operationCounts.textEdits,
+							create: applied.operationCounts.create + renameApplied.operationCounts.create,
+							rename: applied.operationCounts.rename + renameApplied.operationCounts.rename,
+							delete: applied.operationCounts.delete + renameApplied.operationCounts.delete,
+						},
+						fileDetails: [
+							...applied.fileDetails,
+							...renameApplied.fileDetails,
+						],
+					},
+				],
+				status: "success",
+			});
+		}
 
 		return {
 			applied: true,
@@ -3039,7 +3470,7 @@ export class LSPService {
 			inputEditCount: merged.inputEditCount,
 			summary,
 			descriptions: [...applied.descriptions, renameDescription],
-			files: [...new Set([...applied.files, oldFilePath, newFilePath])],
+			files,
 		};
 	}
 
@@ -3449,11 +3880,22 @@ export class LSPService {
 				filePath,
 				workspaceSweepScopeKey,
 			);
-			if (cached) {
+			// #1095 (P2-1 bug-class sweep): both sweeps share cache entries under the
+			// same scopeKey, so this service sweep must apply the SAME content-binding
+			// gate the tools/lsp-diagnostics.ts sibling site does — an entry whose
+			// recorded fingerprint no longer matches disk (bytes changed WITHOUT an
+			// mtime bump the freshness check would catch, exactly what contentHash
+			// exists to detect) must NOT be replayed and reconciled as confirmed via
+			// mode=full. On a mismatch, fall through to a fresh touch.
+			if (cached && cached.binding.boundToCurrentDisk !== false) {
 				cachedResults.push({
 					filePath,
 					diagnostics: cached.diagnostics,
 					count: cached.count,
+					// #1093: a cache hit replays an older observation — carry its
+					// scan time so mode=full's footer reconcile stamps `touchedAt`
+					// with when the truth was seen, not now().
+					observedAt: cached.scannedAt,
 				});
 			} else {
 				filesToTouch.push(filePath);
@@ -3949,11 +4391,28 @@ export class LSPService {
 	 * Get all diagnostics across all tracked files (for cascade checking)
 	 */
 	async getAllDiagnostics(): Promise<
-		Map<string, { diags: import("./client.js").LSPDiagnostic[]; ts: number }>
+		Map<
+			string,
+			{
+				diags: import("./client.js").LSPDiagnostic[];
+				ts: number;
+				binding?: DiagnosticBinding;
+			}
+		>
 	> {
 		const all = new Map<
 			string,
-			{ diags: import("./client.js").LSPDiagnostic[]; ts: number }
+			{
+				diags: import("./client.js").LSPDiagnostic[];
+				ts: number;
+				binding?: DiagnosticBinding;
+			}
+		>();
+		// #1095: per-file stored bindings across every contributing client, merged
+		// into one `boundToCurrentDisk` verdict after the client loop.
+		const bindingsByPath = new Map<
+			string,
+			(StoredDiagnosticBinding | undefined)[]
 		>();
 		const now = Date.now();
 		for (const [_key, client] of this.state.clients) {
@@ -3990,7 +4449,27 @@ export class LSPService {
 				} else {
 					all.set(filePath, { diags: [...entry.diags], ts: entry.ts });
 				}
+				const list = bindingsByPath.get(filePath) ?? [];
+				list.push(entry.binding);
+				bindingsByPath.set(filePath, list);
 			}
+		}
+		// #1095 (P2-2): expose the composed content binding per file LAZILY — the
+		// disk stat+hash verify only runs when a consumer actually reads `.binding`.
+		// The current caller (the cascade, once per edit turn) does NOT read it yet
+		// (binding adoption in cascade/integration.ts is deferred to the second PR),
+		// so this leaves ZERO eager disk cost while still surfacing the field for the
+		// consumer that arrives next. Non-enumerable so incidental spread/serialize
+		// (e.g. logging) can't trigger a stat storm; memoized per entry so repeated
+		// reads verify once.
+		for (const [filePath, entry] of all) {
+			const stored = bindingsByPath.get(filePath) ?? [];
+			let memo: DiagnosticBinding | undefined;
+			Object.defineProperty(entry, "binding", {
+				enumerable: false,
+				configurable: true,
+				get: () => (memo ??= this.mergeBinding(filePath, stored)),
+			});
 		}
 		return all;
 	}
@@ -4093,6 +4572,13 @@ export class LSPService {
 	/**
 	 * Read-only circuit-breaker status, including server/root pairs that have no
 	 * live client and would therefore be absent from getStatus().
+	 *
+	 * #1127: `failureCounts` (spawn/init failures) and `runtimeExitCounts`
+	 * (early post-init runtime exits) are two INDEPENDENT streams feeding one
+	 * circuit — either can trip its own cooldown/permanent-disable on its own
+	 * threshold, without the other. `failures` below is their SUM, purely for
+	 * display: it is the total churn behind whatever cooldown/permanent state
+	 * is showing, not a claim that both streams are at that count.
 	 */
 	getBrokenStatus(): Array<{
 		serverId: string;
@@ -4110,7 +4596,13 @@ export class LSPService {
 			return {
 				serverId: separator >= 0 ? key.slice(0, separator) : key,
 				root: separator >= 0 ? key.slice(separator + 1) : "",
-				failures: this.failureCounts.get(key) ?? 0,
+				// #1127: spawn/init failures and early post-init runtime exits are
+				// two streams feeding the same breaker (see `runtimeExitCounts`
+				// doc) — sum them so this always reflects the total churn behind
+				// a cooldown/permanent-disable, whichever stream produced it.
+				failures:
+					(this.failureCounts.get(key) ?? 0) +
+					(this.runtimeExitCounts.get(key) ?? 0),
 				permanentlyBroken: this.permanentlyBroken.has(key),
 				cooldownUntil: this.state.broken.get(key) ?? 0,
 			};

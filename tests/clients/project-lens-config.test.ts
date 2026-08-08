@@ -624,7 +624,10 @@ describe("loadPiLensProjectConfig", () => {
 			);
 		});
 
-		it("warns once and drops an empty disable list", () => {
+		it("treats an explicitly empty disable list as a silent no-op (#1087)", () => {
+			// #1087 P3-7: `"disable": []` is well-formed — an intentional empty
+			// list — not an error. It must NOT warn (the old code did), and the
+			// pointless entry is dropped rather than stored.
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
 				JSON.stringify({
@@ -632,15 +635,13 @@ describe("loadPiLensProjectConfig", () => {
 				}),
 			);
 			const cfg = loadPiLensProjectConfig(tmpDir);
-			expect(cfg.rules["high-complexity"]?.disable).toBeUndefined();
-			expect(console.error).toHaveBeenCalledWith(
-				expect.stringContaining(
-					"rules.high-complexity.disable must be a non-empty array of strings",
-				),
-			);
+			expect(cfg.rules["high-complexity"]).toBeUndefined();
+			expect(console.error).not.toHaveBeenCalled();
 		});
 
-		it("warns once and drops an empty/non-string select list", () => {
+		it("warns once and drops a non-empty select list with no usable strings", () => {
+			// A NON-empty array whose entries are all blank/non-string is a real
+			// authoring mistake and must still warn (distinct from `[]` above).
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
 				JSON.stringify({
@@ -651,7 +652,7 @@ describe("loadPiLensProjectConfig", () => {
 			expect(cfg.rules["high-complexity"]?.select).toBeUndefined();
 			expect(console.error).toHaveBeenCalledWith(
 				expect.stringContaining(
-					"rules.high-complexity.select must be a non-empty array of strings",
+					"rules.high-complexity.select must contain at least one non-empty string",
 				),
 			);
 		});

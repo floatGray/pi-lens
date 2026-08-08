@@ -30,6 +30,10 @@ import {
 } from "../clients/dispatch/auxiliary-lsp.js";
 import { detectFileRole } from "../clients/file-role.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
+import {
+	hashDiagnosticContent,
+	type DiagnosticBinding,
+} from "../clients/lsp/diagnostic-binding.js";
 import { classifyCascadeWaitTier } from "../clients/lsp/wait-policy/index.js";
 import {
 	attemptTsserverSyncDiagnostics,
@@ -646,6 +650,15 @@ type DiagnosticsCollectionResult = {
 	 * without a second disk read.
 	 */
 	content?: string;
+	/**
+	 * #1095: content binding of the collected result — whether these diagnostics
+	 * were computed against current disk. `boundToCurrentDisk === false` means the
+	 * server's view diverged from disk; the caller demotes such a result to
+	 * "unconfirmed" so a stale-but-fresh-looking result never re-cements the
+	 * widget (#1092). Undefined when the touch path wasn't taken (openFile-only /
+	 * warm-attach / getDiagnostics fallback) → treated as "unknown" (no demotion).
+	 */
+	binding?: DiagnosticBinding;
 };
 
 async function collectDiagnosticsForFile(
@@ -669,7 +682,12 @@ async function collectDiagnosticsForFile(
 	// `touched` is only undefined when touchFile itself couldn't produce a
 	// result (service destroyed, no clients resolved) — that's the one case
 	// that still needs the getDiagnostics() fallback below.
-	let touched: (LSPDiagnostic[] & { inconclusive?: boolean }) | undefined;
+	let touched:
+		| (LSPDiagnostic[] & {
+				inconclusive?: boolean;
+				binding?: DiagnosticBinding;
+		  })
+		| undefined;
 	let usedTouch = false;
 	try {
 		content = fs.readFileSync(absPath, "utf-8");
@@ -713,7 +731,11 @@ async function collectDiagnosticsForFile(
 					clientScope: "all" | "primary";
 				},
 			) => Promise<
-				(LSPDiagnostic[] & { inconclusive?: boolean }) | undefined
+				| (LSPDiagnostic[] & {
+						inconclusive?: boolean;
+						binding?: DiagnosticBinding;
+				  })
+				| undefined
 			>;
 		};
 		if (
@@ -767,7 +789,11 @@ async function collectDiagnosticsForFile(
 					fileRole: detectFileRole(absPath, content),
 				})
 			: diagnostics;
-	return { diagnostics: filtered, timedOut, content };
+	// #1095: surface the touch's content binding (only the touch path carries
+	// one; the openFile-only / getDiagnostics fallback leaves it undefined →
+	// "unknown", no demotion).
+	const binding = usedTouch ? touched?.binding : undefined;
+	return { diagnostics: filtered, timedOut, content, binding };
 }
 
 function diagnosticsToFileDiags(
@@ -885,8 +911,23 @@ function reconcileWidgetFromLspResult(
 	nextWriteIndex: (() => number) | undefined,
 	cwd: string,
 	content: string | undefined,
+	// #1095: true when the result's content binding demonstrably mismatches disk
+	// (boundToCurrentDisk === false). Such a result — even a NON-EMPTY one, which
+	// the pre-#1095 "non-empty is definitionally confirmed" doctrine would have
+	// written straight through — must NOT re-cement the footer with a stale view
+	// (#1092's window-1 transcript: 17 live-looking diagnostics while tsc exits
+	// 0). "unknown"/true bindings leave the doctrine unchanged (fallback preserved
+	// for servers that never bind a version).
+	boundMismatch = false,
+	// #1093: when these `rawDiags` were actually OBSERVED. Fresh touches observe
+	// now (`undefined` → `Date.now()`); a cache HIT replays diagnostics scanned
+	// earlier, so its caller passes the cache entry's `scannedAt` here so the
+	// footer's `touchedAt` isn't re-armed to now() and the mtime-staleness gate
+	// stays live (the #1092 re-arming defect).
+	observedAt?: number,
 ): void {
-	const confirmed = rawDiags.length > 0 || confirmation !== "unconfirmed";
+	const confirmed =
+		(rawDiags.length > 0 || confirmation !== "unconfirmed") && !boundMismatch;
 	if (!confirmed) return;
 	try {
 		// #692: provenance label ONLY — must never affect `rule`/identity (see
@@ -900,7 +941,7 @@ function reconcileWidgetFromLspResult(
 			content ?? "",
 			{ cwd, fileRole: detectFileRole(file, content) },
 		);
-		reconcileScanDiagnostics(file, retagged, true, nextWriteIndex?.());
+		reconcileScanDiagnostics(file, retagged, true, nextWriteIndex?.(), observedAt);
 	} catch {
 		// Never let a footer-reconciliation hiccup fail the diagnostics check.
 	}
@@ -938,7 +979,11 @@ async function collectFileDiagnosticResult(
 
 	if (cacheCtx && scopeKey !== undefined) {
 		const cached = cacheCtx.lookup(file, scopeKey);
-		if (cached) {
+		// #1095: a cached entry whose content binding demonstrably mismatches disk
+		// (bytes changed without the mtime bump the freshness gate would catch) is
+		// NOT served — fall through to a fresh touch instead of replaying a stale
+		// cached result. "unknown"/true bindings serve as before.
+		if (cached && cached.binding.boundToCurrentDisk !== false) {
 			const filteredDiags = applySeverityFilter(cached.diagnostics, severity);
 			const confirmation: "clean" | undefined =
 				cached.diagnostics.length === 0 ? "clean" : undefined;
@@ -946,6 +991,11 @@ async function collectFileDiagnosticResult(
 			// filtered at write time (this same code path); no file content was
 			// cached alongside them, so `undefined` here is a safe re-check, not
 			// a gap.
+			// #1093: this is a CACHE HIT — a replay of an OLD observation. Stamp the
+			// footer's `touchedAt` with the cache entry's original `scannedAt`, NOT
+			// now(), or a repeat check that only re-serves the cache would keep
+			// re-arming the mtime-staleness gate and a resolved finding would render
+			// forever (the #1092 defect).
 			reconcileWidgetFromLspResult(
 				file,
 				cached.diagnostics,
@@ -953,6 +1003,11 @@ async function collectFileDiagnosticResult(
 				nextWriteIndex,
 				cwd,
 				undefined,
+				// This branch only runs when the cache binding is not a mismatch
+				// (guarded above), so boundMismatch is false; #1093's observedAt is
+				// the cache entry's original scan time.
+				false,
+				cached.scannedAt,
 			);
 			return {
 				file,
@@ -967,6 +1022,7 @@ async function collectFileDiagnosticResult(
 		diagnostics: rawDiags,
 		timedOut,
 		content: collectedContent,
+		binding,
 	} = await collectDiagnosticsForFile(file, lspService, waitMs, serverScope);
 	const health = lspService.getDiagnosticsHealth?.(file) as
 		| LspHealthLike
@@ -995,6 +1051,12 @@ async function collectFileDiagnosticResult(
 	} else if (applySeverityFilter(rawDiags, severity).length === 0) {
 		confirmation = await classifyEmptyResult(file, lspService);
 	}
+	// #1095: a result whose content binding demonstrably mismatches disk is
+	// demoted to "unconfirmed" — it must neither confirm the footer nor be cached
+	// as clean, regardless of how many diagnostics it carries (the #1092
+	// re-cementing path). "unknown"/true bindings leave the verdict untouched.
+	const boundMismatch = binding?.boundToCurrentDisk === false;
+	if (boundMismatch) confirmation = "unconfirmed";
 	const filteredDiags = applySeverityFilter(effectiveRawDiags, severity);
 	reconcileWidgetFromLspResult(
 		file,
@@ -1003,15 +1065,25 @@ async function collectFileDiagnosticResult(
 		nextWriteIndex,
 		cwd,
 		collectedContent,
+		boundMismatch,
 	);
 	// #671: only a CONFIRMED outcome ("clean", or a non-empty result — either
 	// is definitionally confirmed per this function's own doctrine above) is
 	// safe to cache; "unconfirmed" (timeout OR a silent-tier server's
 	// unescapable empty push) must never be persisted as a cacheable clean
 	// result — same false-clean bug class `runWorkspaceDiagnostics`'s cache
-	// wiring guards against.
+	// wiring guards against. #1095: the entry carries the content fingerprint so a
+	// later lookup can verify it against disk beyond the mtime proxy.
 	if (cacheCtx && scopeKey !== undefined && confirmation !== "unconfirmed") {
-		cacheCtx.record(file, scopeKey, effectiveRawDiags, stat.mtimeMs);
+		cacheCtx.record(
+			file,
+			scopeKey,
+			effectiveRawDiags,
+			stat.mtimeMs,
+			collectedContent !== undefined
+				? hashDiagnosticContent(collectedContent)
+				: undefined,
+		);
 	}
 	return {
 		file,
@@ -1036,6 +1108,7 @@ async function runFileDiagnostics(
 		diagnostics: rawDiags,
 		timedOut,
 		content: collectedContent,
+		binding,
 	} = await collectDiagnosticsForFile(absPath, lspService, waitMs, serverScope);
 	const lspHealth = lspService.getDiagnosticsHealth?.(absPath) as
 		| LspHealthLike
@@ -1067,6 +1140,11 @@ async function runFileDiagnostics(
 	} else if (applySeverityFilter(rawDiags, severity).length === 0) {
 		confirmation = await classifyEmptyResult(absPath, lspService);
 	}
+	// #1095: demote a result whose content binding mismatches disk to
+	// "unconfirmed" (the #1092 re-cementing path) — a non-empty stale result is no
+	// longer "definitionally confirmed". "unknown"/true bindings are unchanged.
+	const boundMismatch = binding?.boundToCurrentDisk === false;
+	if (boundMismatch) confirmation = "unconfirmed";
 	const filtered = applySeverityFilter(effectiveRawDiags, severity);
 	const total = filtered.length;
 	const truncated = total > MAX_DIAGNOSTICS;
@@ -1079,6 +1157,7 @@ async function runFileDiagnostics(
 		nextWriteIndex,
 		cwd,
 		collectedContent,
+		boundMismatch,
 	);
 
 	const primaryId = primaryServerId(absPath);

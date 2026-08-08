@@ -9,6 +9,7 @@ import {
 	serializeWordIndex,
 	splitIdentifier,
 	tokenizeLine,
+	WORD_INDEX_FORMAT_VERSION,
 	_resetWordIndexBuildGuardForTests,
 	triggerBackgroundWordIndexBuild,
 } from "../../clients/word-index.ts";
@@ -305,6 +306,11 @@ describe("serializeWordIndex / deserializeWordIndex", () => {
 
 	it("treats a legacy serializer version as a cache miss (#958)", () => {
 		const serialized = serializeWordIndex(buildWordIndex(files));
+		// Deliberately pinned to the literal 1, one below WORD_INDEX_FORMAT_VERSION,
+		// to exercise the legacy-format rejection path itself. If the format
+		// version is ever bumped to 1 this assertion fails loudly instead of the
+		// test silently testing nothing (the #1082/#1106 vacuous-fixture class).
+		expect(WORD_INDEX_FORMAT_VERSION).not.toBe(1);
 		const legacy = { ...serialized, version: 1 };
 		expect(deserializeWordIndex(legacy as never)).toBeNull();
 	});

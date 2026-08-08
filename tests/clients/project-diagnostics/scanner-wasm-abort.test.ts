@@ -91,6 +91,7 @@ vi.mock("../../../clients/review-graph/builder.js", async (importOriginal) => {
 import { createHash } from "node:crypto";
 import {
 	loadProjectDiagnosticsSnapshot,
+	PROJECT_DIAGNOSTICS_CACHE_VERSION,
 	saveProjectDiagnosticsSnapshot,
 } from "../../../clients/project-diagnostics/cache.js";
 import { scanProjectDiagnostics } from "../../../clients/project-diagnostics/scanner.js";
@@ -105,7 +106,7 @@ let tmp: string;
 
 function priorSnapshot(): ProjectDiagnosticsSnapshot {
 	return {
-		version: 2,
+		version: PROJECT_DIAGNOSTICS_CACHE_VERSION,
 		cwd: tmp,
 		tier: "cheap",
 		scannedAt: "2026-01-01T00:00:00.000Z",

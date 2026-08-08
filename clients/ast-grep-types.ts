@@ -3,7 +3,6 @@
  *
  * Extracted to prevent circular dependencies between:
  * - ast-grep-client.ts
- * - ast-grep-parser.ts
  * - ast-grep-rule-manager.ts
  */
 

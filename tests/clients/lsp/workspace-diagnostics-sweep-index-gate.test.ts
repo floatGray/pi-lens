@@ -1,7 +1,7 @@
 /**
  * #645: a full-tree `lens_diagnostics mode=full` sweep fires a `didOpen` for
  * every file matching a `workspaceIndexing`-strategy server (marksman today —
- * see server-strategies.ts) in close succession. Before this fix, every one
+ * see wait-policy/strategies.ts) in close succession. Before this fix, every one
  * of those touches independently paid that server's full `aggregateWaitMs`
  * (1500ms for marksman) racing the SAME one-time workspace-index build, so a
  * real project with 34 markdown files burned ~34 * 1500ms of structurally-
@@ -119,7 +119,7 @@ describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndex
 		expect(waitCalls.length).toBe(3);
 
 		// First same-sweep touch to "marksman" pays the full strategy budget
-		// (1500ms per server-strategies.ts); the next two touches in the SAME
+		// (1500ms per wait-policy/strategies.ts); the next two touches in the SAME
 		// sweep use the much shorter warm-wait budget (250ms) instead of
 		// independently re-paying the full 1500ms each.
 		expect(waitCalls[0]?.ms).toBe(1500);
@@ -190,7 +190,7 @@ describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndex
 
 		// python's strategy has no `workspaceIndexing` flag — every touch in
 		// the sweep keeps paying its own full strategy budget (1500ms per
-		// server-strategies.ts), unaffected by the #645 gate.
+		// wait-policy/strategies.ts), unaffected by the #645 gate.
 		expect(waitCalls).toEqual([1500, 1500]);
 	});
 });

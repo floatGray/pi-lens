@@ -45,7 +45,10 @@ import { warmTriggerFor } from "../clients/project-diagnostics/extractors.js";
 import type { FreshProjectDiagnosticsResult } from "../clients/project-diagnostics/fresh-fetch.js";
 import { fetchFreshProjectDiagnostics } from "../clients/project-diagnostics/fresh-fetch.js";
 import { loadBootstrapClients } from "../clients/bootstrap.js";
-import { scanTruncationNotice } from "../clients/lens-engine.js";
+import {
+	generatedSkipNotice,
+	scanTruncationNotice,
+} from "../clients/lens-engine.js";
 import { scanProjectDiagnostics } from "../clients/project-diagnostics/scanner.js";
 import type {
 	ProjectDiagnostic,
@@ -101,6 +104,11 @@ type WorkspaceLspDiagnosticResult = {
 	// file's per-file check didn't complete within budget (or threw), so
 	// `diagnostics` is a default-empty placeholder, not a confirmed result.
 	timedOut?: boolean;
+	// #1093: set only for cache-hit results (a replay of an older scan) — the
+	// wall-clock time the diagnostics were originally observed. Threaded into the
+	// footer reconcile so a cache-served mode=full doesn't re-arm the widget's
+	// mtime-staleness gate. See LSPWorkspaceDiagnosticResult.observedAt.
+	observedAt?: number;
 };
 
 // Wall-clock ceiling for the whole mode=full scan. Even with per-file budgets
@@ -257,6 +265,12 @@ export function createLensDiagnosticsTool(
 						"mode=full only: cap the number of files routed through the language server for the project-wide LSP sweep. On large projects (e.g. a Next.js app with thousands of source files) the uncapped sweep can take many minutes; set this to bound it. Default is generous (env PI_LENS_LSP_WORKSPACE_MAX_FILES, else 5000).",
 				}),
 			),
+			includeGenerated: Type.Optional(
+				Type.Boolean({
+					description:
+						"mode=full refreshRunners=cheap/all only (no effect with refreshRunners=cached/none, since no project scan runs to apply it to): scan WITHOUT the generated/artifact NAME-heuristic filter (lockfiles, gen.ts-style names, generated/ dirs, …). Default false. Use when a scan's 'excluded by generated-name heuristics' notice suggests a real file was skipped.",
+				}),
+			),
 			severity: Type.Optional(
 				Type.String({
 					enum: ["error", "warning", "all"],
@@ -305,6 +319,7 @@ export function createLensDiagnosticsTool(
 					: undefined;
 			const maxProjectFiles = parsePositiveInt(params.maxProjectFiles);
 			const maxLspFiles = parsePositiveInt(params.maxLspFiles);
+			const includeGenerated = params.includeGenerated === true;
 			const cwd = ctx.cwd ?? getCwd();
 
 			let pathsScope: PathsScope | undefined;
@@ -359,6 +374,7 @@ export function createLensDiagnosticsTool(
 					refreshRunners,
 					maxProjectFiles,
 					maxLspFiles,
+					includeGenerated,
 					signal: fullSignal,
 					wallClockMs: FULL_SCAN_WALL_CLOCK_MS,
 					onProgress,
@@ -1140,6 +1156,7 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 		maxProjectFiles?: number;
 		signal?: AbortSignal;
 		files?: string[];
+		includeGenerated?: boolean;
 	},
 ): Promise<ProjectDiagnosticsSnapshot | undefined> {
 	if (shouldRefreshProjectDiagnostics(options.refreshRunners)) {
@@ -1149,6 +1166,7 @@ async function getProjectDiagnosticsSnapshotForFullMode(
 			maxFiles: options.maxProjectFiles,
 			signal: options.signal,
 			files: options.files,
+			includeGenerated: options.includeGenerated,
 		});
 	}
 	if (shouldUseCachedProjectDiagnostics(options.refreshRunners)) {
@@ -1178,6 +1196,12 @@ async function formatFullMode(
 		onServerReady?: () => void;
 		pathsScope?: PathsScope;
 		nextWriteIndex?: () => number;
+		/**
+		 * #1107 phase 2 review: scan WITHOUT the generated/artifact NAME-
+		 * heuristic filter — the actionable opt-out `generatedSkipNotice`
+		 * points a user at. Default false.
+		 */
+		includeGenerated?: boolean;
 	} = {},
 ): Promise<{ content: [{ type: "text"; text: string }]; details: object }> {
 	const runWorkspaceDiagnostics = lspService.runWorkspaceDiagnostics;
@@ -1300,6 +1324,13 @@ async function formatFullMode(
 				retagged,
 				true,
 				nextWriteIndex?.(),
+				// #1093: `observedAt` is set only when this result was served from
+				// the workspace-diagnostics cache (a replay of an older scan) —
+				// stamp `touchedAt` with when it was scanned, not now(), so a
+				// mode=full that only re-serves the cache can't keep a resolved
+				// finding on screen by re-arming the mtime gate. Undefined for
+				// freshly-touched results (observed now).
+				result.observedAt,
 			);
 		} catch {
 			// Never let a footer-reconciliation hiccup fail the scan itself.
@@ -1521,6 +1552,14 @@ async function formatFullMode(
 	const scanTruncatedNote = scanTruncatedNoticeText
 		? `\n\n${scanTruncatedNoticeText}`
 		: "";
+	// #1107 phase 2: same "reached the seam, nothing rendered it" gap as #784
+	// above, for the generated-name/dir skip counters.
+	const generatedSkipNoticeText = projectSnapshot
+		? generatedSkipNotice(projectSnapshot)
+		: undefined;
+	const generatedSkipNote = generatedSkipNoticeText
+		? `\n\n${generatedSkipNoticeText}`
+		: "";
 	const abortedNote =
 		abortedIds.size > 0
 			? `\n\nstopped mid-scan (still running in the background, not reflected in this result): ${[
@@ -1580,6 +1619,20 @@ async function formatFullMode(
 			// #784: lets a caller check "was the cheap project scan truncated"
 			// without parsing the text note.
 			projectScanTruncated: projectSnapshot?.scanTruncated ?? false,
+			// #1107 phase 2: same machine-readable convention, for the
+			// generated-name/dir skip counters.
+			...(projectSnapshot?.generatedFileSkips
+				? { projectGeneratedFileSkips: projectSnapshot.generatedFileSkips }
+				: {}),
+			...(projectSnapshot?.generatedNameOnlySkips
+				? {
+						projectGeneratedNameOnlySkips:
+							projectSnapshot.generatedNameOnlySkips,
+					}
+				: {}),
+			...(projectSnapshot?.generatedDirSkips
+				? { projectGeneratedDirSkips: projectSnapshot.generatedDirSkips }
+				: {}),
 		},
 	};
 	// Stopped mid-scan: the results above are whatever completed before the abort.
@@ -1610,6 +1663,7 @@ async function formatFullMode(
 						failedNote +
 						walkUnsafeRootNote +
 						scanTruncatedNote +
+						generatedSkipNote +
 						abortedNote +
 						freshNote +
 						missingNote,
@@ -1625,6 +1679,7 @@ async function formatFullMode(
 		failedNote ||
 		walkUnsafeRootNote ||
 		scanTruncatedNote ||
+		generatedSkipNote ||
 		abortedNote ||
 		freshNote ||
 		unconfirmedLspNote ||
@@ -1643,6 +1698,7 @@ async function formatFullMode(
 						failedNote +
 						walkUnsafeRootNote +
 						scanTruncatedNote +
+						generatedSkipNote +
 						abortedNote +
 						freshNote +
 						missingNote,

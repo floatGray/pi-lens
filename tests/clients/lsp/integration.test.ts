@@ -190,17 +190,21 @@ describe("LSP Client Integration", () => {
 
 	it("applies a server-initiated edit solicited during executeCommand", async () => {
 		const file = path.join(
-			fs.mkdtempSync(path.join(os.tmpdir(), "lsp-exec-")),
-			"target.ts",
+			process.cwd(),
+			`.lsp-exec-${process.pid}-${Date.now()}.ts`,
 		);
 		fs.writeFileSync(file, "hello world", "utf-8");
-		const res = await client!.executeCommand("fake.applyEdit", [
-			pathToFileURL(file).href,
-		]);
-		expect(res.executed).toBe(true);
-		expect((res.result as { applied?: boolean }).applied).toBe(true);
-		// The gate (serverEditsAllowed) was open during the call, so the edit landed.
-		expect(fs.readFileSync(file, "utf-8")).toBe("EDITED world");
+		try {
+			const res = await client!.executeCommand("fake.applyEdit", [
+				pathToFileURL(file).href,
+			]);
+			expect(res.executed).toBe(true);
+			expect((res.result as { applied?: boolean }).applied).toBe(true);
+			// The gate (serverEditsAllowed) was open during the call, so the edit landed.
+			expect(fs.readFileSync(file, "utf-8")).toBe("EDITED world");
+		} finally {
+			fs.rmSync(file, { force: true });
+		}
 	});
 
 	it("shuts down gracefully", async () => {

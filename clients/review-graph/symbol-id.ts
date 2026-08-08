@@ -60,3 +60,61 @@ export function buildSymbolId(
 ): string {
 	return `${filePath}:${name}:${kind}:${startLine}`;
 }
+
+/**
+ * Structural shape of a kind token in a canonical symbol id: every kind this
+ * repo mints — the fixed `buildSymbolId` vocabulary (`function`, `method`,
+ * `class`, ...) AND the open-ended LSP-fallback vocabulary from
+ * `lspSymbolKindName` (`enum`, `struct`, `type-parameter`, `enum-member`, the
+ * `lsp-symbol-<n>` catch-all for unknown LSP `SymbolKind` numbers, ...) —
+ * is a lowercase word optionally hyphen-segmented, never containing a colon.
+ * Matching this SHAPE (rather than whitelisting specific kind strings) keeps
+ * `parseSymbolKey` in agreement with whatever kind vocabulary either minter
+ * uses, present or future, without needing a matching update here.
+ */
+const KIND_TOKEN_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+
+export interface ParsedSymbolKey {
+	filePath: string;
+	symbolName?: string;
+	kind?: string;
+	line?: number;
+}
+
+/**
+ * Parse both canonical symbol IDs and the legacy `file:name` compatibility
+ * shape. Canonical IDs are recognized from their typed line suffix, so drive
+ * letters and colons in POSIX filenames are data rather than separators. A
+ * known file hint makes the legacy form lossless too; without it, legacy IDs
+ * remain inherently ambiguous and use their historical final separator.
+ */
+export function parseSymbolKey(
+	key: string,
+	knownFilePath?: string,
+): ParsedSymbolKey {
+	if (key.startsWith("file:")) {
+		return { filePath: key.slice("file:".length) };
+	}
+	const canonical = /^(.*):([^:]*):([^:]+):(\d+)$/.exec(key);
+	if (canonical && KIND_TOKEN_RE.test(canonical[3])) {
+		return {
+			filePath: canonical[1],
+			symbolName: canonical[2] || undefined,
+			kind: canonical[3],
+			line: Number(canonical[4]),
+		};
+	}
+	if (knownFilePath && key.startsWith(`${knownFilePath}:`)) {
+		return {
+			filePath: knownFilePath,
+			symbolName: key.slice(knownFilePath.length + 1) || undefined,
+		};
+	}
+	const separator = key.lastIndexOf(":");
+	return separator < 0
+		? { filePath: key }
+		: {
+				filePath: key.slice(0, separator),
+				symbolName: key.slice(separator + 1) || undefined,
+			};
+}

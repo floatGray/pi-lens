@@ -48,6 +48,42 @@ export interface ProjectDiagnosticsSnapshot {
 	 * never persisted over the last authoritative snapshot (#891).
 	 */
 	scanTruncated?: boolean;
+	/**
+	 * #1107 phase 2: source files this scan's walk KEPT OUT because they
+	 * matched a generated/artifact NAME or content-header heuristic
+	 * (`source-filter.ts`'s `generatedOrArtifactSkips` counter) — the RAW
+	 * total across every evidence tier (lockfiles, declaration files,
+	 * minified/bundle/chunk output, content/header-confirmed matches, AND the
+	 * unconfirmed name-only bucket). Full-observability field; NOT what the
+	 * user-facing notice keys off — see `generatedNameOnlySkips` below and
+	 * `generatedSkipNotice`'s doc for why the raw total fires on virtually
+	 * every real repo (any lockfile alone trips it). Only present (and only
+	 * nonzero) when this scan actually walked (`options.files` scans never
+	 * populate it, matching `scanTruncated`/`entryBudgetExceeded`'s existing
+	 * convention).
+	 */
+	generatedFileSkips?: number;
+	/**
+	 * #1107 phase 2 review round 2: the SUBSET of `generatedFileSkips` whose
+	 * `"generated"` verdict came from `GeneratedArtifactEvidence: "name-only"`
+	 * (`source-filter.ts`'s `generatedNameOnlySkips` counter) — a WEAK
+	 * generated-artifact NAME match trusted with NO corroborating evidence
+	 * check at all. This is the genuinely at-risk, false-positive-prone
+	 * bucket the content-probe escape hatch could not evaluate; the
+	 * tool-facing notice (`generatedSkipNotice`) keys off THIS, not the raw
+	 * `generatedFileSkips` total. Same presence convention as
+	 * `generatedFileSkips`.
+	 */
+	generatedNameOnlySkips?: number;
+	/**
+	 * #1107 phase 2: whole DIRECTORIES this scan's walk pruned because their
+	 * NAME looked generated (`shouldRecurseIntoDir`'s
+	 * `isGeneratedArtifactDirectoryName` branch; `generatedDirSkips` on
+	 * `SourceCollectionResult`) — one count per directory pruned, not per file
+	 * inside it (the directory's contents are never enumerated). Same
+	 * presence convention as `generatedFileSkips`.
+	 */
+	generatedDirSkips?: number;
 }
 
 export interface ProjectDiagnosticsDeltaReport {
@@ -87,4 +123,15 @@ export interface ProjectDiagnosticsScanOptions {
 	files?: string[];
 	/** Override for `os.homedir()`, primarily for tests (mirrors fresh-fetch). */
 	homeDir?: string;
+	/**
+	 * #1107 phase 2 review (P2): scan WITHOUT the generated/artifact NAME
+	 * heuristic filter — the actionable opt-out `generatedSkipNotice`
+	 * (`lens-engine.ts`) points a user at when a scan's excluded-by-heuristic
+	 * count looks suspicious. Threaded straight through to
+	 * `collectSourceFilesWithBudgetAsync`'s `includeGenerated` (source-filter.ts);
+	 * default `false` (existing filtering behavior unchanged). Only meaningful
+	 * on a walk (`options.files` scans never filter by this heuristic in the
+	 * first place).
+	 */
+	includeGenerated?: boolean;
 }

@@ -56,8 +56,17 @@ export function applyInlineSuppressions<T extends SuppressibleDiagnostic>(
 		const suppressedLine = i + 1; // same line (1-based)
 		const nextLine = i + 2; // next line (1-based)
 		for (const ruleId of rules) {
-			suppressed.add(`${suppressedLine}:${ruleId}`);
-			suppressed.add(`${nextLine}:${ruleId}`);
+			// #1087: normalize the COMMENT token too, not just the diagnostic id.
+			// The diagnostic side below matches raw OR normalized, so storing only
+			// the raw comment token made `// pi-lens-ignore: no-eval-js` fail to
+			// suppress a finding surfaced under the normalized `no-eval`, while the
+			// identical `disable: ["no-eval-js"]` config key worked (rule-policy
+			// normalizes both sides). Add the normalized form so the two suppression
+			// surfaces stay symmetric.
+			for (const key of new Set([ruleId, normalizeRuleId(ruleId)])) {
+				suppressed.add(`${suppressedLine}:${key}`);
+				suppressed.add(`${nextLine}:${key}`);
+			}
 		}
 	}
 

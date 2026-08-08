@@ -107,7 +107,7 @@ describe("classifyCleanBehavior (phase-aware 4-way)", () => {
 
 describe("checkCleanSignalDrift (#529)", () => {
   it("flags marked-not-silent when the marker says silent but the probe observed a publish", () => {
-    // The stale-marker direction: server-strategies.ts is too pessimistic.
+    // The stale-marker direction: wait-policy/strategies.ts is too pessimistic.
     const d = checkCleanSignalDrift(
       { lang: "typescript", behavior: "publishes-unversioned" },
       true,

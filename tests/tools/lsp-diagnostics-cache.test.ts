@@ -40,8 +40,11 @@ vi.mock("../../clients/lsp/index.js", async () => {
 	};
 });
 
-vi.mock("../../clients/widget-state.js", () => ({
+const { reconcileScanDiagnostics } = vi.hoisted(() => ({
 	reconcileScanDiagnostics: vi.fn(),
+}));
+vi.mock("../../clients/widget-state.js", () => ({
+	reconcileScanDiagnostics,
 }));
 
 import { createLspDiagnosticsTool } from "../../tools/lsp-diagnostics.js";
@@ -58,6 +61,7 @@ describe("lsp_diagnostics batch — workspace-diagnostics cache (#671)", () => {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-diag-cache-"));
 		// Legacy per-project data dir marker so the cache writes inside tmpDir.
 		fs.mkdirSync(path.join(tmpDir, ".pi-lens"));
+		reconcileScanDiagnostics.mockClear();
 		getServersForFileWithConfig.mockReset();
 		getServersForFileWithConfig.mockImplementation((fp: string) => {
 			const id = serverIdForFile(fp);
@@ -178,5 +182,54 @@ describe("lsp_diagnostics batch — workspace-diagnostics cache (#671)", () => {
 		const second = await runBatch(files);
 		expect(touchFile).not.toHaveBeenCalled();
 		expect(second.details?.totalDiagnostics).toBe(1);
+	});
+
+	it("a cache-hit reconcile stamps the footer with the cache's ORIGINAL scan time, not now (#1093/#1092)", async () => {
+		const files = writeFiles(["a.ts"]);
+		const diag = {
+			severity: 1,
+			message: "boom",
+			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			source: "typescript",
+		};
+		touchFile.mockResolvedValueOnce([diag]);
+
+		await runBatch(files);
+		// The fresh touch was OBSERVED now → no observation-time override.
+		const freshCall = reconcileScanDiagnostics.mock.calls.find((c) =>
+			String(c[0]).endsWith("a.ts"),
+		);
+		expect(freshCall).toBeDefined();
+		expect(freshCall?.[4]).toBeUndefined();
+
+		// The wall-clock time the cache recorded this scan at.
+		const cacheFile = path.join(
+			tmpDir,
+			".pi-lens",
+			"cache",
+			"lsp-workspace-diagnostics.json",
+		);
+		const cache = JSON.parse(fs.readFileSync(cacheFile, "utf8")) as {
+			entries: Record<string, { scannedAt: number }>;
+		};
+		const scannedAt = Object.values(cache.entries)[0]!.scannedAt;
+
+		reconcileScanDiagnostics.mockClear();
+		touchFile.mockClear();
+
+		// A second identical sweep is served from the cache — a replay of an OLD
+		// observation. The footer reconcile must be stamped with the cache's
+		// original scan time so it can't re-arm the widget's mtime-staleness gate.
+		const second = await runBatch(files);
+		expect(second.isError).toBeUndefined();
+		expect(touchFile).not.toHaveBeenCalled();
+		const hitCall = reconcileScanDiagnostics.mock.calls.find((c) =>
+			String(c[0]).endsWith("a.ts"),
+		);
+		expect(hitCall).toBeDefined();
+		// Pre-fix: the cache-hit branch passed NO observation time (undefined) → the
+		// footer re-stamped `touchedAt = Date.now()` on every re-serve, permanently
+		// disarming the mtime gate (#1092). Post-fix: it carries the scan time.
+		expect(hitCall?.[4]).toBe(scannedAt);
 	});
 });

@@ -40,11 +40,15 @@ export interface TestFailure {
 }
 
 // Runner detection: config file → runner name
-interface RunnerConfig {
+export interface RunnerConfig {
 	configFiles: string[];
 	command: string;
-	// Name of the binary in node_modules/.bin — defaults to the runner key.
-	// When a local binary is found, args()[0] (the runner name passed to npx) is dropped.
+	// Name of the binary in node_modules/.bin (and every package manager's
+	// global bin dir) — defaults to the runner key. Must match the ACTUAL
+	// binary name resolution looks for (e.g. rspec's real binary is "bundle",
+	// not "rspec" — see the rspec entry below), because `stripWrapperArgs`
+	// only drops args()'s leading element(s) when they match this name (see
+	// its doc comment for the exact wrapper-convention rule it applies).
 	binName?: string;
 	args: (testFile: string, cwd: string) => string[];
 	parseJson: boolean;
@@ -106,7 +110,7 @@ const MAX_PYTEST_RECURSE_DEPTH = 3;
 
 // --- Runner Detection ---
 
-const RUNNERS: Record<string, RunnerConfig> = {
+export const RUNNERS: Record<string, RunnerConfig> = {
 	vitest: {
 		configFiles: ["vitest.config.ts", "vitest.config.js", "vitest.config.mjs"],
 		command: "npx",
@@ -182,6 +186,11 @@ const RUNNERS: Record<string, RunnerConfig> = {
 	rspec: {
 		configFiles: [".rspec", "spec/spec_helper.rb"],
 		command: "bundle",
+		// The real binary is "bundle" (the command runs `bundle exec rspec
+		// <file>`), NOT "rspec" — without this, binName defaulted to the
+		// runner key "rspec" and local/global resolution looked for the wrong
+		// binary name (#1098).
+		binName: "bundle",
 		args: (testFile, _cwd) => ["exec", "rspec", testFile],
 		parseJson: false,
 	},
@@ -208,6 +217,25 @@ const RUNNERS: Record<string, RunnerConfig> = {
 		parseJson: false, // mix test's default output is text-based
 	},
 };
+
+/**
+ * Drop the leading arg(s) of a runner's args() that merely NAME the binary
+ * being invoked (the npx-wrapper convention: `npx vitest run …` → once
+ * `vitest` becomes the resolved command itself, the leading "vitest" arg is
+ * redundant). This must NOT strip a real subcommand.
+ *
+ * Two wrapper shapes are recognized:
+ *   - `[binName, ...rest]` (vitest/jest-style: `npx <bin> ...`) → drop 1.
+ *   - `["-m", binName, ...rest]` (pytest-style: `python -m <bin> ...`) → drop 2.
+ * Anything else (cargo's `["test", "--no-fail-fast"]`, go's
+ * `["test", "-run", …]`, rspec's `["exec", "rspec", file]` once binName is
+ * "bundle", etc.) is a real subcommand/argv and is returned unchanged (#1098).
+ */
+export function stripWrapperArgs(binName: string, args: string[]): string[] {
+	if (args[0] === binName) return args.slice(1);
+	if (args[0] === "-m" && args[1] === binName) return args.slice(2);
+	return args;
+}
 
 // --- Client ---
 
@@ -1558,8 +1586,12 @@ export class TestRunnerClient {
 	 * Resolve the executable and args for a runner, preferring a local
 	 * node_modules/.bin binary over npx to avoid the ~150ms npx startup cost.
 	 *
-	 * When a local binary is used, args()[0] (the runner name that npx needs)
-	 * is dropped since it becomes the command itself.
+	 * When a resolved binary becomes the command itself, `stripWrapperArgs`
+	 * drops ONLY the leading arg(s) that named the wrapped binary — never a
+	 * real subcommand (#1098: `cargo test --no-fail-fast` unconditionally lost
+	 * `test` here because the old code assumed every runner's args() started
+	 * with an npx-style runner-name arg, which only holds for wrapper-style
+	 * runners like vitest/jest/pytest).
 	 */
 	private async resolveExec(
 		runner: string,
@@ -1584,16 +1616,16 @@ export class TestRunnerClient {
 		const localBin = path.join(cwd, "node_modules", ".bin", binName + suffix);
 
 		// A resolved binary (local, or any manager's global bin) becomes the command
-		// itself, so the leading runner-name arg (e.g. "vitest") that npx needs is
-		// dropped from args().
+		// itself, so the leading wrapper-name arg(s) that named it (e.g. "vitest",
+		// or "-m pytest") are stripped from args() — see stripWrapperArgs.
 		if (fs.existsSync(localBin)) {
-			return { command: localBin, args: config.args(testFile, cwd).slice(1) };
+			return { command: localBin, args: stripWrapperArgs(binName, config.args(testFile, cwd)) };
 		}
 
 		// Any package manager's global bin dir (npm/pnpm/yarn/bun) before npx (#375).
 		const globalBin = await findGlobalBinary(binName);
 		if (globalBin) {
-			return { command: globalBin, args: config.args(testFile, cwd).slice(1) };
+			return { command: globalBin, args: stripWrapperArgs(binName, config.args(testFile, cwd)) };
 		}
 
 		return { command: config.command, args: config.args(testFile, cwd) };

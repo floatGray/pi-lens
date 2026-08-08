@@ -9,6 +9,7 @@ import {
 	getBiomeConfigPath,
 	getFormatterPolicyForFile,
 	getJstsLintPolicy,
+	getLinterPolicyForCwd,
 	getLinterPolicyForFile,
 	getPreferredAutofixTools,
 	getPreferredJstsLintRunners,
@@ -34,6 +35,7 @@ import {
 	hasNearestPackageJsonField,
 	hasOcamlformatConfig,
 	hasOxfmtConfig,
+	hasOxfmtSvelteConfig,
 	hasOxlintConfig,
 	hasPhpCsFixerConfig,
 	hasPhpstanConfig,
@@ -44,6 +46,7 @@ import {
 	hasStandardrbConfig,
 	hasStylelintConfig,
 	hasStyluaConfig,
+	hasTflintConfig,
 	hasVitePlusConfig,
 	hasYamllintConfig,
 	isSafePipelineAutofixTool,
@@ -191,6 +194,19 @@ describe("tool-policy", () => {
 			defaultFormatter: "taplo",
 			defaultWhenUnconfigured: true,
 		});
+		expect(getFormatterPolicyForFile("/tmp/terragrunt.hcl")).toMatchObject({
+			defaultFormatter: "terragrunt-hcl",
+			defaultWhenUnconfigured: true,
+		});
+		expect(getFormatterPolicyForFile("/tmp/root.hcl")).toMatchObject({
+			defaultFormatter: "terragrunt-hcl",
+			defaultWhenUnconfigured: true,
+		});
+		expect(getFormatterPolicyForFile("/tmp/Terragrunt.HCL")).toMatchObject({
+			defaultFormatter: "terragrunt-hcl",
+			defaultWhenUnconfigured: true,
+		});
+		expect(getFormatterPolicyForFile("/tmp/foo.hcl")).toBeUndefined();
 	});
 
 	it("chooses autofix tools from config-aware smart defaults", () => {
@@ -299,6 +315,22 @@ describe("tool-policy", () => {
 			preferredRunners: ["yamllint"],
 			gate: "smart-default",
 		});
+		expect(getLinterPolicyForFile("/tmp/terragrunt.hcl", {})).toMatchObject({
+			preferredRunners: ["terragrunt"],
+			defaultRunner: "terragrunt",
+			gate: "smart-default",
+		});
+		expect(getLinterPolicyForFile("/tmp/root.hcl", {})).toMatchObject({
+			preferredRunners: ["terragrunt"],
+			defaultRunner: "terragrunt",
+			gate: "smart-default",
+		});
+		expect(getLinterPolicyForFile("/tmp/Root.HCL", {})).toMatchObject({
+			preferredRunners: ["terragrunt"],
+			defaultRunner: "terragrunt",
+			gate: "smart-default",
+		});
+		expect(getLinterPolicyForFile("/tmp/foo.hcl", {})).toBeUndefined();
 		expect(getLinterPolicyForFile("/tmp/file.md", {})).toMatchObject({
 			preferredRunners: ["markdownlint"],
 			gate: "smart-default",
@@ -344,6 +376,20 @@ describe("tool-policy", () => {
 			getLinterPolicyForFile("/tmp/file.go", { hasGolangciConfig: true }),
 		).toMatchObject({
 			preferredRunners: ["golangci-lint"],
+			gate: "config-first",
+		});
+		// Terraform: tflint has built-in rules, so it stays a smart default with no
+		// config. A project `.tflint.hcl` is an explicit opt-in, which promotes it
+		// to config-first the same way `.golangci.yml` does for Go.
+		expect(getLinterPolicyForFile("/tmp/file.tf", {})).toMatchObject({
+			preferredRunners: ["tflint"],
+			defaultRunner: "tflint",
+			gate: "smart-default",
+		});
+		expect(
+			getLinterPolicyForFile("/tmp/file.tfvars", { hasTflintConfig: true }),
+		).toMatchObject({
+			preferredRunners: ["tflint"],
 			gate: "config-first",
 		});
 	});
@@ -596,6 +642,12 @@ describe("tool-policy", () => {
 					"# cmake-format config\n",
 					() => hasCmakeFormatConfig(nestedDir),
 				],
+				[
+					"tflint",
+					".tflint.hcl",
+					'plugin "terraform" {\n  enabled = true\n}\n',
+					() => hasTflintConfig(nestedDir),
+				],
 			];
 
 			for (const [name, configFile, content, detector] of cases) {
@@ -603,6 +655,43 @@ describe("tool-policy", () => {
 				expect(detector(), name).toBe(true);
 				fs.rmSync(path.join(env.tmpDir, configFile));
 			}
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// The tflint runner resolves `.tflint.hcl` by walking up from the EDITED
+	// FILE's directory, so the policy has to ask the same question from the same
+	// place. Keyed off the project cwd it would miss every config that lives in a
+	// terraform subdirectory — the common monorepo layout — and report
+	// smart-default for a project that had explicitly configured tflint.
+	it("detects a .tflint.hcl that lives below the project root", () => {
+		const env = setupTestEnvironment("pi-lens-tflint-policy-root-");
+		try {
+			const stackDir = path.join(env.tmpDir, "infra", "stack");
+			fs.mkdirSync(stackDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(env.tmpDir, "infra", ".tflint.hcl"),
+				'plugin "terraform" {\n  enabled = true\n}\n',
+			);
+
+			expect(
+				getLinterPolicyForCwd(path.join(stackDir, "main.tf"), env.tmpDir),
+			).toMatchObject({ preferredRunners: ["tflint"], gate: "config-first" });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("leaves the terraform policy at smart-default with no .tflint.hcl anywhere", () => {
+		const env = setupTestEnvironment("pi-lens-tflint-policy-none-");
+		try {
+			const stackDir = path.join(env.tmpDir, "infra", "stack");
+			fs.mkdirSync(stackDir, { recursive: true });
+
+			expect(
+				getLinterPolicyForCwd(path.join(stackDir, "main.tf"), env.tmpDir),
+			).toMatchObject({ preferredRunners: ["tflint"], gate: "smart-default" });
 		} finally {
 			env.cleanup();
 		}
@@ -808,6 +897,110 @@ describe("tool-policy", () => {
 		} finally {
 			env.cleanup();
 		}
+	});
+
+	// oxfmt's .svelte support is conditional beyond the generic hasOxfmtConfig
+	// check — verified empirically against the real oxfmt npm binary (see
+	// PR #1134 body for the full four-cell matrix). Both the `svelte` package
+	// AND the config's `svelte` flag are required; either alone always fails.
+	describe("hasOxfmtSvelteConfig (#1134)", () => {
+		it("is true with the svelte package and {\"svelte\": true} in .oxfmtrc.json", () => {
+			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-json-");
+			try {
+				createTempFile(
+					env.tmpDir,
+					"package.json",
+					JSON.stringify({
+						devDependencies: { oxfmt: "^0.54.0", svelte: "^5.0.0" },
+					}),
+				);
+				createTempFile(
+					env.tmpDir,
+					".oxfmtrc.json",
+					JSON.stringify({ svelte: true }),
+				);
+				expect(hasOxfmtSvelteConfig(env.tmpDir)).toBe(true);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("is true with the svelte package and `svelte = true` in oxfmt.toml", () => {
+			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-toml-");
+			try {
+				createTempFile(
+					env.tmpDir,
+					"package.json",
+					JSON.stringify({ devDependencies: { svelte: "^5.0.0" } }),
+				);
+				createTempFile(env.tmpDir, "oxfmt.toml", "svelte = true\n");
+				expect(hasOxfmtSvelteConfig(env.tmpDir)).toBe(true);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("is false without the svelte package, even with the config flag on", () => {
+			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-nopackage-");
+			try {
+				createTempFile(
+					env.tmpDir,
+					".oxfmtrc.json",
+					JSON.stringify({ svelte: true }),
+				);
+				expect(hasOxfmtSvelteConfig(env.tmpDir)).toBe(false);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("is false with the svelte package but no config flag", () => {
+			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-noflag-");
+			try {
+				createTempFile(
+					env.tmpDir,
+					"package.json",
+					JSON.stringify({ devDependencies: { svelte: "^5.0.0" } }),
+				);
+				expect(hasOxfmtSvelteConfig(env.tmpDir)).toBe(false);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("is false when the config flag is explicitly false", () => {
+			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-false-");
+			try {
+				createTempFile(
+					env.tmpDir,
+					"package.json",
+					JSON.stringify({ devDependencies: { svelte: "^5.0.0" } }),
+				);
+				createTempFile(
+					env.tmpDir,
+					".oxfmtrc.json",
+					JSON.stringify({ svelte: false }),
+				);
+				expect(hasOxfmtSvelteConfig(env.tmpDir)).toBe(false);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("is false for a generic oxfmt.toml that doesn't set the svelte key", () => {
+			const env = setupTestEnvironment("pi-lens-tool-policy-oxfmt-svelte-generic-toml-");
+			try {
+				createTempFile(
+					env.tmpDir,
+					"package.json",
+					JSON.stringify({ devDependencies: { svelte: "^5.0.0" } }),
+				);
+				createTempFile(env.tmpDir, "oxfmt.toml", "# oxfmt config\n");
+				expect(hasOxfmtSvelteConfig(env.tmpDir)).toBe(false);
+			} finally {
+				env.cleanup();
+			}
+		});
 	});
 
 	it("hasMypyConfig detects [tool.mypy] in a parent directory pyproject.toml", () => {

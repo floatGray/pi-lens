@@ -35,6 +35,58 @@ describe("GitHub release asset selection", () => {
 		}
 	});
 
+	// Table-driven entries (archAssetMatch) only carry x64/arm64 assets, so an
+	// exotic arch must resolve to nothing rather than to the x64 substring.
+	it("returns undefined for a non-x64/arm64 arch on table-driven tools", async () => {
+		const { resolveGitHubAsset } = await import("../../../clients/installer/index.ts");
+
+		for (const toolId of ["gitleaks", "terragrunt"] as const) {
+			expect(resolveGitHubAsset(toolId, "linux", "ia32")).toBeUndefined();
+			expect(resolveGitHubAsset(toolId, "win32", "ia32")).toBeUndefined();
+		}
+	});
+
+	// Bare-binary tools (terragrunt/marksman/expert) resolve to the FULL asset
+	// name, which is a strict prefix of every signature/checksum sibling — a
+	// plain `includes` scan installs the sidecar it happens to see first.
+	describe("pickReleaseAsset", () => {
+		it("prefers the exact asset over a signature sibling listed first", async () => {
+			const { pickReleaseAsset } = await import("../../../clients/installer/index.ts");
+			const assets = [
+				{ name: "terragrunt_linux_amd64.asc" },
+				{ name: "terragrunt_linux_amd64" },
+			];
+			expect(pickReleaseAsset(assets, "terragrunt_linux_amd64")?.name).toBe(
+				"terragrunt_linux_amd64",
+			);
+		});
+
+		it("skips sidecars when only a substring match exists", async () => {
+			const { pickReleaseAsset } = await import("../../../clients/installer/index.ts");
+			const assets = [
+				{ name: "tflint_linux_amd64.zip.sha256" },
+				{ name: "tflint_linux_amd64.zip" },
+			];
+			expect(pickReleaseAsset(assets, "linux_amd64.zip")?.name).toBe(
+				"tflint_linux_amd64.zip",
+			);
+		});
+
+		it("returns undefined when every match is a sidecar", async () => {
+			const { pickReleaseAsset } = await import("../../../clients/installer/index.ts");
+			expect(
+				pickReleaseAsset([{ name: "expert_linux_amd64.sig" }], "expert_linux_amd64"),
+			).toBeUndefined();
+		});
+
+		it("still matches a plain substring asset with no sidecars present", async () => {
+			const { pickReleaseAsset } = await import("../../../clients/installer/index.ts");
+			expect(
+				pickReleaseAsset([{ name: "marksman-linux-x64" }], "marksman-linux-x64")?.name,
+			).toBe("marksman-linux-x64");
+		});
+	});
+
 	it("returns undefined for unknown tool id", async () => {
 		const { resolveGitHubAsset } = await import("../../../clients/installer/index.ts");
 		expect(resolveGitHubAsset("nonexistent-tool" as GitHubToolId, "linux", "x64")).toBeUndefined();
@@ -91,6 +143,24 @@ describe("GitHub release asset selection", () => {
 		] as const)("%s/%s → %s", async (platform, arch, expected) => {
 			const { resolveGitHubAsset } = await import("../../../clients/installer/index.ts");
 			expect(resolveGitHubAsset("golangci-lint", platform, arch)).toBe(expected);
+		});
+	});
+
+	// Terragrunt ships bare per-platform binaries; win32/arm64 falls back to the
+	// x64 binary (Windows emulation) because no arm64 asset exists upstream.
+	describe("terragrunt asset patterns", () => {
+		it.each([
+			["linux", "x64", "terragrunt_linux_amd64"],
+			["linux", "arm64", "terragrunt_linux_arm64"],
+			["darwin", "x64", "terragrunt_darwin_amd64"],
+			["darwin", "arm64", "terragrunt_darwin_arm64"],
+			["win32", "x64", "terragrunt_windows_amd64.exe"],
+			["win32", "arm64", "terragrunt_windows_amd64.exe"],
+		] as const)("%s/%s → %s", async (platform, arch, expected) => {
+			const { resolveGitHubAsset } = await import(
+				"../../../clients/installer/index.ts"
+			);
+			expect(resolveGitHubAsset("terragrunt", platform, arch)).toBe(expected);
 		});
 	});
 

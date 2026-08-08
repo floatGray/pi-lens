@@ -46,6 +46,10 @@ const EXEMPT = new Map<string, string>([
 		"trivy-config",
 		"IaC misconfig; trivy.enabled-gated (off by default), needs trivy + opt-in fixture",
 	],
+	[
+		"terragrunt",
+		"terragrunt CLI JSON shape is unverified (binary not installed in dev/CI to confirm `hcl validate --json` output); no fixture yet",
+	],
 	// No live fixture yet — the remaining-linters backlog.
 	["actionlint", "no fixture yet"],
 	["vale", "no fixture yet"],

@@ -1,8 +1,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { TestRunnerClient } from "../../clients/test-runner-client.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+
+// Only the resolveExec matrix below (#1098) needs this mocked; every other
+// test in this file never reaches a `findGlobalBinary` call.
+const findGlobalBinary = vi.fn<(command: string) => Promise<string | undefined>>();
+vi.mock("../../clients/package-manager.js", () => ({
+	findGlobalBinary: (command: string) => findGlobalBinary(command),
+}));
 
 const cleanups: Array<() => void> = [];
 
@@ -804,5 +811,202 @@ describe("test-runner-client", () => {
 		expect(result.failed).toBe(1);
 		expect(result.failures[0].name).toBe("test creates a user");
 		expect(result.failures[0].location).toBe("Demo.Accounts.UserTest");
+	});
+});
+
+/**
+ * Regression matrix for #1098: `resolveExec` used to drop
+ * `config.args(testFile, cwd)[0]` UNCONDITIONALLY whenever local-bin or
+ * global-bin resolution succeeded — an npx-wrapper-convention assumption
+ * (arg 0 names the binary, like `npx vitest run …`) that only holds for
+ * wrapper-style runners (vitest/jest/pytest). For direct runners whose
+ * args() leads with a REAL subcommand (`cargo test --no-fail-fast`,
+ * `go test -run . ./pkg`, `dotnet test --no-build`, `mvn test -q`,
+ * `mix test <file>`), the same unconditional `.slice(1)` silently ate the
+ * subcommand — e.g. `cargo test --no-fail-fast` became the argv-invalid
+ * `cargo --no-fail-fast` (a clap usage error), which the runner then
+ * misreported as "1/1 failed" at turn-end.
+ *
+ * The fix (`stripWrapperArgs` in clients/test-runner-client.ts) only drops
+ * the leading arg(s) when they actually NAME the resolved binary — either
+ * `[binName, ...]` (vitest/jest) or `["-m", binName, ...]` (pytest) — and
+ * leaves everything else untouched.
+ *
+ * This asserts the invariant generically by iterating the EXPORTED
+ * `RUNNERS` config table (not a hand-copied runner list), across every
+ * resolution path `resolveExec` can take:
+ *   - local-bin hit  (a real file dropped in node_modules/.bin, or
+ *                      vendor/bin for phpunit's Composer convention)
+ *   - global-bin hit (findGlobalBinary mocked to resolve)
+ *   - fallback       (neither resolves; config.command is used verbatim)
+ * so a future runner added to RUNNERS is automatically covered.
+ *
+ * The expected argv for each case is computed independently of the
+ * production `stripWrapperArgs` helper (a local re-statement of the same
+ * contract), so a regression that reintroduces unconditional stripping (or
+ * any other over/under-stripping) fails this test rather than trivially
+ * agreeing with whatever the implementation currently does.
+ */
+describe("resolveExec argv preservation matrix (#1098)", () => {
+	const resolveCleanups: Array<() => void> = [];
+
+	beforeEach(() => {
+		findGlobalBinary.mockReset();
+		findGlobalBinary.mockResolvedValue(undefined);
+	});
+
+	afterEach(() => {
+		for (const c of resolveCleanups.splice(0)) c();
+	});
+
+	function expectedStrippedArgs(binName: string, args: string[]): string[] {
+		if (args[0] === binName) return args.slice(1);
+		if (args[0] === "-m" && args[1] === binName) return args.slice(2);
+		return args;
+	}
+
+	function binSuffix(): string {
+		return process.platform === "win32" ? ".cmd" : "";
+	}
+
+	for (const [runnerKey, config] of Object.entries(RUNNERS)) {
+		const binName = config.binName ?? runnerKey;
+
+		describe(`runner: ${runnerKey}`, () => {
+			it("preserves argv on local-bin resolution", () => {
+				const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+				resolveCleanups.push(cleanup);
+				const client = new TestRunnerClient(false) as any;
+
+				let localBinPath: string;
+				if (runnerKey === "phpunit") {
+					const phpSuffix = process.platform === "win32" ? ".bat" : "";
+					localBinPath = path.join(tmpDir, "vendor", "bin", `phpunit${phpSuffix}`);
+				} else {
+					localBinPath = path.join(
+						tmpDir,
+						"node_modules",
+						".bin",
+						`${binName}${binSuffix()}`,
+					);
+				}
+				fs.mkdirSync(path.dirname(localBinPath), { recursive: true });
+				fs.writeFileSync(localBinPath, "");
+
+				const testFile = path.join(
+					tmpDir,
+					`sample_test${runnerKey === "go" ? ".go" : ".txt"}`,
+				);
+				const rawArgs = config.args(testFile, tmpDir);
+
+				return client
+					.resolveExec(runnerKey, config, testFile, tmpDir)
+					.then((resolved: { command: string; args: string[] }) => {
+						expect(resolved.command).toBe(localBinPath);
+						// phpunit's local (vendor/bin) resolution never strips —
+						// see the dedicated branch in resolveExec.
+						const expected =
+							runnerKey === "phpunit" ? rawArgs : expectedStrippedArgs(binName, rawArgs);
+						expect(resolved.args).toEqual(expected);
+					});
+			});
+
+			if (runnerKey !== "phpunit") {
+				// phpunit has no separate global-bin resolution step — its
+				// non-local branch falls straight through to the fallback
+				// (`command: "phpunit"`), so it's covered by the fallback case
+				// below instead of duplicated here.
+				it("preserves argv on global-bin resolution", () => {
+					const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+					resolveCleanups.push(cleanup);
+					const client = new TestRunnerClient(false) as any;
+
+					const globalBinPath = path.join(tmpDir, "global-bin", binName);
+					findGlobalBinary.mockImplementation(async (name: string) =>
+						name === binName ? globalBinPath : undefined,
+					);
+
+					const testFile = path.join(
+						tmpDir,
+						`sample_test${runnerKey === "go" ? ".go" : ".txt"}`,
+					);
+					const rawArgs = config.args(testFile, tmpDir);
+
+					return client
+						.resolveExec(runnerKey, config, testFile, tmpDir)
+						.then((resolved: { command: string; args: string[] }) => {
+							expect(resolved.command).toBe(globalBinPath);
+							expect(resolved.args).toEqual(expectedStrippedArgs(binName, rawArgs));
+						});
+				});
+			}
+
+			it("preserves argv verbatim on fallback (no local/global bin)", () => {
+				const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+				resolveCleanups.push(cleanup);
+				const client = new TestRunnerClient(false) as any;
+
+				const testFile = path.join(
+					tmpDir,
+					`sample_test${runnerKey === "go" ? ".go" : ".txt"}`,
+				);
+				const rawArgs = config.args(testFile, tmpDir);
+
+				return client
+					.resolveExec(runnerKey, config, testFile, tmpDir)
+					.then((resolved: { command: string; args: string[] }) => {
+						expect(resolved.command).toBe(
+							runnerKey === "phpunit" ? "phpunit" : config.command,
+						);
+						// Fallback never resolves a binary to become the command, so
+						// there is nothing to strip — args() is used verbatim.
+						expect(resolved.args).toEqual(rawArgs);
+					});
+			});
+		});
+	}
+
+	it("cargo's subcommand survives local-bin resolution (the reported #1098 case)", () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+		resolveCleanups.push(cleanup);
+		const client = new TestRunnerClient(false) as any;
+
+		const localBinPath = path.join(tmpDir, "node_modules", ".bin", `cargo${binSuffix()}`);
+		fs.mkdirSync(path.dirname(localBinPath), { recursive: true });
+		fs.writeFileSync(localBinPath, "");
+
+		const testFile = path.join(tmpDir, "src", "lib.rs");
+
+		return client
+			.resolveExec("cargo", RUNNERS.cargo, testFile, tmpDir)
+			.then((resolved: { command: string; args: string[] }) => {
+				expect(resolved.command).toBe(localBinPath);
+				// Pre-fix, this was ["--no-fail-fast"] (the "test" subcommand was
+				// eaten), producing a clap usage error at spawn time.
+				expect(resolved.args).toEqual(["test", "--no-fail-fast"]);
+			});
+	});
+
+	it("rspec resolves the real binary name (bundle), not the runner key", () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-resolve-exec-");
+		resolveCleanups.push(cleanup);
+		const client = new TestRunnerClient(false) as any;
+
+		const bundleBinPath = path.join(tmpDir, "global-bin", "bundle");
+		findGlobalBinary.mockImplementation(async (name: string) =>
+			name === "bundle" ? bundleBinPath : undefined,
+		);
+
+		const testFile = path.join(tmpDir, "spec", "foo_spec.rb");
+
+		return client
+			.resolveExec("rspec", RUNNERS.rspec, testFile, tmpDir)
+			.then((resolved: { command: string; args: string[] }) => {
+				expect(resolved.command).toBe(bundleBinPath);
+				// "exec" is a real bundle subcommand, not the binary name — must
+				// survive intact so `bundle exec rspec <file>` reaches bundle.
+				expect(resolved.args).toEqual(["exec", "rspec", testFile]);
+				expect(findGlobalBinary).toHaveBeenCalledWith("bundle");
+			});
 	});
 });

@@ -10,7 +10,7 @@
  *
  * Why: opengrep has no `workspace/diagnostic` pull support (push-only, per
  * `docs/servercapabilities.md`), and `reopenOnResync: true`
- * (`clients/lsp/server-strategies.ts`) means every LSP touch already forces a
+ * (`clients/lsp/wait-policy/strategies.ts`) means every LSP touch already forces a
  * full re-scan of that one file — there's no incremental efficiency lost by
  * moving bulk scans off the per-file touch loop. On a full sweep the old path
  * instead paid opengrep's full per-file wait-tier budget serially, one file at

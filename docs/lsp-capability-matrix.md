@@ -18,7 +18,7 @@ regenerated docs — so this file self-populates from CI without manual copy-pas
 
 `probe-clean-signal.mjs` also runs a **drift check** (#529): it compares each
 probed server's observed `clean-behavior` against the hand-set `silentOnClean`
-marker in `clients/lsp/server-strategies.ts` and writes any mismatch to the
+marker in `clients/lsp/wait-policy/strategies.ts` and writes any mismatch to the
 `## silentOnClean drift` section below. This is telemetry only — never a CI
 gate — because the probe is a timing-based negative observation; a mismatch
 just tells a human the marker may need updating. `unknown` observations are
@@ -150,7 +150,7 @@ the rest fill in as the nightly reaches them.
 ## silentOnClean drift (nightly-generated)
 
 Telemetry only — never a CI gate. Compares each probed server's observed
-`clean-behavior` against `clients/lsp/server-strategies.ts`'s `silentOnClean`
+`clean-behavior` against `clients/lsp/wait-policy/strategies.ts`'s `silentOnClean`
 marker; a mismatch means the marker may need a human update (#529). `unknown`
 observations are never compared (a slow/absent server is not evidence either way).
 

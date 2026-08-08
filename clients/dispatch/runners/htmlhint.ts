@@ -12,6 +12,7 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
 
 const htmlhint = createAvailabilityChecker("htmlhint");
 
@@ -95,11 +96,11 @@ const htmlhintRunner: RunnerDefinition = {
 			{ cwd },
 		);
 
-		if (result.error && !result.stdout && !result.stderr) {
+		const output = result.stdout || result.stderr || "";
+		if (spawnFailedWithNoOutput(result, output)) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 
-		const output = result.stdout || result.stderr || "";
 		const diagnostics = parseHtmlhintOutput(output, ctx.filePath);
 
 		if (diagnostics.length === 0) {

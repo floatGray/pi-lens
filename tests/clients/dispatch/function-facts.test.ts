@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import {
@@ -5,9 +7,9 @@ import {
   type FunctionSummary,
 } from "../../../clients/dispatch/facts/function-facts.js";
 
-async function run(content: string): Promise<FunctionSummary[]> {
+async function run(content: string, ext = "ts"): Promise<FunctionSummary[]> {
   const facts = new FactStore();
-  const filePath = "/tmp/fn.ts";
+  const filePath = `/tmp/fn.${ext}`;
   facts.setFileFact(filePath, "file.content", content);
   await functionFactProvider.run({ filePath } as never, facts);
   return facts.getFileFact<FunctionSummary[]>(filePath, "file.functionSummaries") ?? [];
@@ -15,6 +17,16 @@ async function run(content: string): Promise<FunctionSummary[]> {
 
 const byName = (s: FunctionSummary[], name: string) =>
   s.find((f) => f.name === name);
+
+async function runFixture(name: string): Promise<FunctionSummary[]> {
+  return run(
+    fs.readFileSync(
+      path.join(process.cwd(), "tests", "fixtures", "function-facts", name),
+      "utf8",
+    ),
+    path.extname(name).slice(1),
+  );
+}
 
 describe("functionFactProvider — names & forms", () => {
   it("names function declarations, methods, and const-bound arrows/expressions", async () => {
@@ -39,6 +51,15 @@ const fnExpr = function (z: number) { return z; };
     const s = await run(`const id = (x: number) => x;`);
     // No block body ⇒ no summary (matches the old !isBlock skip).
     expect(s).toHaveLength(0);
+  });
+});
+
+describe("functionFactProvider — JavaScript parameters", () => {
+  it("uses a leaf identifier parameter name in a real JS fixture", async () => {
+    const s = await runFixture("javascript-parameter.js");
+    const wrap = byName(s, "wrap")!;
+    expect(wrap.isPassThroughWrapper).toBe(true);
+    expect(wrap.passThroughTarget).toBe("inner");
   });
 });
 
@@ -103,6 +124,35 @@ function c(n: number) {
     const p = byName(s, "p")!;
     expect(p.parameterCount).toBe(3);
     expect(p.statementCount).toBe(2);
+  });
+
+  // refs #1089 P3-4: object_pattern/array_pattern params vanish from
+  // parameterCount in plain JavaScript but are counted in TypeScript. The
+  // JS grammar places a top-level destructured param directly as an
+  // `object_pattern`/`array_pattern` child of `formal_parameters` (no
+  // wrapper node); the TS grammar always wraps every parameter — including
+  // destructured ones — in a `required_parameter`/`optional_parameter` node,
+  // which getParameters() already recognized. So the SAME source construct
+  // counted correctly in .ts and undercounted in .js.
+  it("counts destructured object/array params in TypeScript", async () => {
+    const s = await run(
+      `function f({ a, b }: { a: number; b: number }, [c, d]: number[]) { return a; }`,
+      "ts",
+    );
+    expect(byName(s, "f")!.parameterCount).toBe(2);
+  });
+
+  it("counts destructured object/array params in plain JavaScript (parity with TS)", async () => {
+    const s = await run(
+      `function f({ a, b }, [c, d]) { return a; }`,
+      "js",
+    );
+    expect(byName(s, "f")!.parameterCount).toBe(2);
+  });
+
+  it("counts a mix of plain and destructured params in JavaScript", async () => {
+    const s = await run(`function g(x, { a, b }, y) { return x; }`, "js");
+    expect(byName(s, "g")!.parameterCount).toBe(3);
   });
 
   it("collects distinct outgoing calls", async () => {

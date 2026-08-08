@@ -107,7 +107,7 @@ export interface LSPServerInfo {
 				 * id, when a single `LSPServerInfo.id` can mean more than one actual
 				 * server (e.g. "typescript" = classic typescript-language-server OR
 				 * TS7's native `tsc --lsp --stdio`). Per-server behavioral knowledge
-				 * keyed by server id (`server-strategies.ts`'s `silentOnClean` etc.)
+				 * keyed by server id (`wait-policy/strategies.ts`'s `silentOnClean` etc.)
 				 * is only proven for the variant it was measured against — this lets
 				 * such knowledge-consumers (the #458 cascade tier classifier) tell
 				 * the variants apart. Undefined = single-variant server, or a

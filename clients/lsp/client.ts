@@ -25,8 +25,19 @@ import {
 	StreamMessageWriter,
 } from "../deps/vscode-jsonrpc.js";
 import { getAmbientAbortSignal } from "../safe-spawn.js";
+import {
+	hashDiagnosticContent,
+	type StoredDiagnosticBinding,
+} from "./diagnostic-binding.js";
+import {
+	newLspMutationCorrelationId,
+	type LspMutationContext,
+} from "../lsp-mutation.js";
 
-import { applyWorkspaceEdit } from "./edits.js";
+import {
+	applyWorkspaceEdit,
+	normalizeWorkspaceEditToUtf16,
+} from "./edits.js";
 import { recordLspChild, removeLspChild } from "../instance-registry.js";
 import type { LSPProcess } from "./launch.js";
 import { normalizeMapKey, uriToPath } from "./path-utils.js";
@@ -225,6 +236,25 @@ export interface LSPClientInfo {
 	isAlive: () => boolean;
 	/** True if the server process has exited or been killed */
 	processExited: () => boolean;
+	/**
+	 * #1127: true only when THIS client's own `shutdown()` was called before
+	 * it went dead (session teardown, `#743` notify-backpressure eviction,
+	 * generation resets, …). False for a genuine crash — process exit/signal
+	 * with no preceding `shutdown()` call — so a caller respawning a dead
+	 * client can tell a deliberate kill apart from an unexpected runtime exit
+	 * and only count the latter toward the failure breaker.
+	 */
+	wasShutdownIntentional: () => boolean;
+	/**
+	 * #1127: wall-clock time this client FIRST observed its own death
+	 * (connection close/error or process exit, whichever fires first), or
+	 * `undefined` if it hasn't died yet. A caller computing server lifetime
+	 * MUST use this, not the time it happened to notice the client was dead —
+	 * detection is lazy (the next file attach) and can trail the actual death
+	 * by minutes to hours (#1127's documented opengrep pattern), which would
+	 * make every early crash look like a long, healthy run.
+	 */
+	getExitedAt: () => number | undefined;
 	/** Last N lines of server stderr for diagnostics */
 	recentStderr: (lines?: number) => string;
 	/** Pre-request health check — returns error string if process is dead */
@@ -240,6 +270,14 @@ export interface LSPClientInfo {
 		change(filePath: string, content: string): Promise<void>;
 	};
 	getDiagnostics(filePath: string): LSPDiagnostic[];
+	/**
+	 * #1095: the stored content binding for the diagnostics currently tracked
+	 * for `filePath` — {version?, contentHash?} of the document version those
+	 * diagnostics were computed against. `undefined` when nothing is tracked or
+	 * the server never reported a version (a version-less server → caller treats
+	 * the binding as "unknown", i.e. pre-#1095 behavior).
+	 */
+	getDiagnosticBinding(filePath: string): StoredDiagnosticBinding | undefined;
 	/** Monotonic counter bumped when fresh diagnostics are stored for this client. */
 	readonly diagnosticsVersion: number;
 	waitForDiagnostics(
@@ -247,8 +285,13 @@ export interface LSPClientInfo {
 		timeoutMs?: number,
 		options?: { minVersion?: number; pullOnly?: boolean },
 	): Promise<void>;
-	/** Get all tracked diagnostics with timestamps (for cascade checking) */
-	getAllDiagnostics(): Map<string, { diags: LSPDiagnostic[]; ts: number }>;
+	/** Get all tracked diagnostics with timestamps (for cascade checking). #1095:
+	 *  each entry also carries the stored content `binding` (absent when no
+	 *  version-bearing publish set it). */
+	getAllDiagnostics(): Map<
+		string,
+		{ diags: LSPDiagnostic[]; ts: number; binding?: StoredDiagnosticBinding }
+	>;
 	pruneDiagnostics(
 		predicate: (
 			filePath: string,
@@ -295,6 +338,7 @@ export interface LSPClientInfo {
 	executeCommand(
 		command: string,
 		args?: unknown[],
+		mutationContext?: LspMutationContext,
 	): Promise<{ executed: boolean; result?: unknown; reason?: string }>;
 	/** Go to definition — returns Location[] */
 	definition(
@@ -337,6 +381,10 @@ export interface LSPClientInfo {
 	documentSymbol(filePath: string): Promise<LSPSymbol[]>;
 	/** Whether this exact document has already been opened on the server. */
 	isDocumentOpen(filePath: string): boolean;
+	/** URI spelling used when this document was opened. */
+	getDocumentUri(filePath: string): string | undefined;
+	/** Close an open document, if present, without opening or spawning anything. */
+	closeDocument(filePath: string): Promise<void>;
 	/** Workspace-wide symbol search */
 	workspaceSymbol(query: string): Promise<LSPSymbol[]>;
 	/** Available code actions at a range */
@@ -360,7 +408,12 @@ export interface LSPClientInfo {
 		newFilePath: string,
 	): Promise<LSPWorkspaceEdit | null>;
 	/** Notify server after a source file rename. */
-	didRenameFiles(oldFilePath: string, newFilePath: string): Promise<void>;
+	didRenameFiles(
+		oldFilePath: string,
+		newFilePath: string,
+		oldUri?: string,
+		newUri?: string,
+	): Promise<void>;
 	/** Go to implementation */
 	implementation(
 		filePath: string,
@@ -534,6 +587,20 @@ export interface LSPClientState {
 	 *  before the process 'exit' event fires (the ordering that previously
 	 *  made every crash silently look "expected"). */
 	shutdownRequested: boolean;
+	/**
+	 * #1127: wall-clock time the client FIRST observed its own death (whichever
+	 * of connection close/error or the process 'exit' event fires first — see
+	 * `setupConnectionLifecycle`). Detection of a dead client happens lazily,
+	 * on the next `getClientForFile` attach — which, per #1127's real-world
+	 * pattern, can be minutes to hours after the process actually died. A
+	 * caller computing "how long did this server live" MUST use
+	 * `exitedAt - spawnedAt`, never `detectionTime - spawnedAt`: the latter
+	 * conflates "dead quickly" with "attached to rarely" and would wrongly
+	 * exempt an early-crashing server from the runtime-exit breaker just
+	 * because nobody happened to touch it again for a while. `undefined`
+	 * until the client actually dies.
+	 */
+	exitedAt: number | undefined;
 	connectionDisposed: boolean;
 	lastError: Error | undefined;
 	readonly connection: MessageConnection;
@@ -550,7 +617,25 @@ export interface LSPClientState {
 	 *  reports a version; absent entries mean "version unknown" and are treated
 	 *  as fresh so version-less servers keep working. */
 	readonly diagnosticDocVersions: Map<string, number>;
+	/** #1095: the exact content fingerprint of the LAST didOpen/didChange payload
+	 *  we sent for a path, tagged with the document version it was sent as.
+	 *  Captured at SEND time on in-memory content (never a disk read on the
+	 *  notification path) so a later `publishDiagnostics` echoing that version can
+	 *  bind its diagnostics to the content they were computed against. */
+	readonly documentContentHashes: Map<
+		string,
+		{ version: number; hash: string }
+	>;
+	/** #1095: the content binding for the diagnostics currently stored for a path
+	 *  — {version, contentHash} of the document those diagnostics were computed
+	 *  against. Set only when the accepted publish carried a version; a version-
+	 *  less server never populates this, so its binding reads "unknown" and
+	 *  behavior is unchanged. Kept in lockstep with `pushDiagnostics`: written on
+	 *  publish accept, cleared by `clearDiagnosticsForPath`. */
+	readonly diagnosticBindings: Map<string, StoredDiagnosticBinding>;
 	readonly openDocuments: Set<string>;
+	/** Original URI spelling for each open document; path keys are normalized. */
+	readonly openDocumentUris?: Map<string, string>;
 	readonly pendingOpens: Set<string>;
 	/** Mutable: updated by applyDynamicCapabilities after registerCapability events */
 	workspaceDiagnosticsSupport: LSPWorkspaceDiagnosticsSupport;
@@ -581,6 +666,10 @@ export interface LSPClientState {
 	 * disk whenever it likes — only as the direct effect of an opted-in command).
 	 */
 	serverEditsAllowed: number;
+	/** One active command context is safe to associate with a nested applyEdit.
+	 * Concurrent commands deliberately clear this rather than cross-correlate. */
+	activeMutationContext?: LspMutationContext;
+	activeMutationDepth?: number;
 	readonly serverId: string;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts). Undefined =
 	 *  single-variant server or not yet reported. */
@@ -724,12 +813,34 @@ export async function killProcessTree(
 	};
 
 	try {
+		// #1114: gate the escalation on OBSERVED exit, not `proc.killed`. Node
+		// only sets `proc.killed = true` when `proc.kill()` (the ChildProcess
+		// method) successfully SENDS a signal — never when the process actually
+		// dies, and the primary SIGTERM path above goes through the raw
+		// `process.kill(-pid, …)` process-group call, which never touches
+		// `proc.killed` at all. Checking `!proc.killed` here was therefore
+		// either always-true (unconditional SIGKILL after the window,
+		// regardless of whether the group already died — group-kill path) or
+		// always-false/dead (direct-child fallback path, same shape as the
+		// safe-spawn escalation bug). An `exit` listener set once, up front,
+		// gives a real observed-death signal for both. Seeded from the same
+		// `exitCode`/`signalCode` pre-check the top-of-function early return
+		// uses (:689) — that early return is skipped when
+		// `options.processExiting` is set, so a process that was ALREADY dead
+		// on entry can still reach here; without seeding, `exited` would stay
+		// false (the "exit" event already fired before this listener was
+		// attached) and the fast/non-fast branches below would still fire a
+		// redundant group SIGKILL at the escalation window.
+		let exited = proc.exitCode != null || proc.signalCode != null;
+		proc.once?.("exit", () => {
+			exited = true;
+		});
 		if (!killPosixProcessGroup("SIGTERM")) {
 			killDirectChild("SIGTERM");
 		}
 		if (options.fast) {
 			const timer = setTimeout(() => {
-				if (!(proc as { killed?: boolean }).killed) {
+				if (!exited) {
 					logLatency({
 						type: "phase",
 						phase: "lsp_kill_escalation",
@@ -766,7 +877,7 @@ export async function killProcessTree(
 			}, 1500);
 			proc.once?.("exit", onExit);
 		});
-		if (!exitedInTime && !(proc as { killed?: boolean }).killed) {
+		if (!exitedInTime && !exited) {
 			logLatency({
 				type: "phase",
 				phase: "lsp_kill_escalation",
@@ -860,8 +971,33 @@ function clearDiagnosticsForPath(
 	state.documentPullDiagnostics?.delete(normalizedPath);
 	state.documentPullDiagnosticTimestamps?.delete(normalizedPath);
 	state.diagnosticDocVersions?.delete(normalizedPath);
+	// #1095: a cleared path must never serve a stale content binding alongside a
+	// later publish — drop it with the diagnostics it described. (The last-sent
+	// `documentContentHashes` record is intentionally retained: it describes what
+	// we sent, which the NEXT publish for that version still needs to bind to.)
+	state.diagnosticBindings?.delete(normalizedPath);
 	legacy.diagnostics?.delete(normalizedPath);
 	legacy.diagnosticTimestamps?.delete(normalizedPath);
+}
+
+/**
+ * #1095: fingerprint the EXACT didOpen/didChange payload text at SEND time and
+ * tag it with the document version it was sent as, so a later
+ * `publishDiagnostics` echoing that version can bind its diagnostics to the
+ * content they were computed against. Runs on in-memory content — never a disk
+ * read on the notification path (I1). Bounded by the same file-size gates the
+ * caller already applies to the content it hands us.
+ */
+function recordSentContent(
+	state: LSPClientState,
+	normalizedPath: string,
+	version: number,
+	content: string,
+): void {
+	state.documentContentHashes.set(normalizedPath, {
+		version,
+		hash: hashDiagnosticContent(content),
+	});
 }
 
 // Methods that can be registered dynamically and map to operationSupport keys
@@ -975,6 +1111,27 @@ export function setupIncomingHandlers(
 				if (docVersion !== undefined) {
 					state.diagnosticDocVersions.set(normalizedPath, docVersion);
 				}
+				recordBinding();
+			};
+			// #1095: bind the just-stored diagnostics to the content they were
+			// computed against. Only when the server reported a version AND we still
+			// hold the sent-content fingerprint for exactly that version — otherwise
+			// no contentHash is recorded, so the binding reads "unknown" and a
+			// version-less server behaves exactly as before. Runs at the same
+			// write-time moment as `pushDiagnostics.set` (superseded pushes are
+			// dropped before this via `isSupersededPush`, so a binding never lags the
+			// latest sent version).
+			const recordBinding = (): void => {
+				if (docVersion === undefined) {
+					state.diagnosticBindings.delete(normalizedPath);
+					return;
+				}
+				const sent = state.documentContentHashes.get(normalizedPath);
+				state.diagnosticBindings.set(normalizedPath, {
+					version: docVersion,
+					contentHash:
+						sent && sent.version === docVersion ? sent.hash : undefined,
+				});
 			};
 
 			// Late/superseded-push guard: if the server stamped this push with a
@@ -1089,10 +1246,26 @@ export function setupIncomingHandlers(
 			if (state.serverEditsAllowed <= 0 || !params?.edit) {
 				return { applied: false, failureReason: "edit not solicited" };
 			}
+			const context =
+				(state.activeMutationDepth ?? 0) === 1
+					? state.activeMutationContext
+					: undefined;
+			const telemetryContext: LspMutationContext =
+				context ?? {
+					cwd: state.root,
+					correlationId: newLspMutationCorrelationId(),
+					tool: "lsp-workspace-applyEdit",
+					source: "lsp-edit",
+				};
 			try {
 				await applyWorkspaceEdit(
 					params.edit as Parameters<typeof applyWorkspaceEdit>[0],
 					state.root,
+					{
+						positionEncoding: state.positionEncoding,
+						documentVersions: state.documentVersions,
+						mutationContext: telemetryContext,
+					},
 				);
 				return { applied: true };
 			} catch (err) {
@@ -1121,6 +1294,19 @@ export function setupIncomingHandlers(
 	state.connection.onRequest("window/workDoneProgress/create", async () => {});
 }
 
+/**
+ * #1127: record the FIRST moment this client observed its own death. Detection
+ * of a dead client (the next `getClientForFile` attach in index.ts) can happen
+ * long after the process actually died — this timestamp is the only reliable
+ * "when did it die" signal, so it must be set here, at the earliest death
+ * signal, not derived later from detection time.
+ */
+function markExitedIfUnset(state: LSPClientState): void {
+	if (state.exitedAt === undefined) {
+		state.exitedAt = Date.now();
+	}
+}
+
 function setupConnectionLifecycle(
 	state: LSPClientState,
 	recentStderr: (lines?: number) => string,
@@ -1129,12 +1315,14 @@ function setupConnectionLifecycle(
 		state.lastError = error instanceof Error ? error : new Error(String(error));
 		state.isConnected = false;
 		state.isDestroyed = true;
+		markExitedIfUnset(state);
 		disposeClientConnection(state);
 	});
 
 	state.connection.onClose(() => {
 		state.isConnected = false;
 		state.isDestroyed = true;
+		markExitedIfUnset(state);
 		disposeClientConnection(state);
 	});
 
@@ -1150,6 +1338,7 @@ function setupConnectionLifecycle(
 		const wasIntentional = state.shutdownRequested;
 		state.isConnected = false;
 		state.isDestroyed = true;
+		markExitedIfUnset(state);
 		disposeClientConnection(state);
 		if (!wasIntentional) {
 			logLatency({
@@ -1404,8 +1593,8 @@ export async function handleNotifyOpen(
 	silent = false,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
-	const uri = pathToFileURL(filePath).href;
 	const normalizedPath = normalizeMapKey(filePath);
+	const uri = state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
 	if (
 		state.openDocuments.has(normalizedPath) ||
@@ -1416,6 +1605,12 @@ export async function handleNotifyOpen(
 		// preserveDiagnostics: skip cache clear for format-only resyncs so
 		// waitForDiagnostics fast-paths instead of waiting up to 5s for TypeScript
 		// to re-publish what it already knows (formatting doesn't change semantics).
+		// #1095 note: this also retains the prior content `binding`. Until the
+		// server republishes for the new version, a binding read compares the OLD
+		// content hash against the NEW disk bytes → boundToCurrentDisk `false` →
+		// the consumer demotes to inconclusive. That's the SAFE (#533) direction (a
+		// transient "unconfirmed", never a false-clean), self-healing on the next
+		// publish — not a correctness hazard, unlike the reopen false-TRUE above.
 		if (!preserveDiagnostics) {
 			clearDiagnosticsForPath(state, normalizedPath);
 		}
@@ -1427,18 +1622,31 @@ export async function handleNotifyOpen(
 				textDocument: { uri },
 			});
 			state.openDocuments.delete(normalizedPath);
-			state.documentVersions.set(normalizedPath, 0);
+			state.openDocumentUris?.delete(normalizedPath);
+			// #1095 (P2-3): carry the version counter FORWARD across the
+			// close+reopen instead of resetting to 0. LSP lets a didOpen use any
+			// version, and reusing 0 for successive resyncs made the version
+			// ambiguous — a late publish for an earlier resync's content echoed the
+			// SAME 0 as the current send, so the superseded-push guard (0 < 0 is
+			// false) accepted it and `recordBinding` bound STALE diagnostics to the
+			// CURRENT content's fingerprint → an affirmative boundToCurrentDisk TRUE
+			// for a stale view (worse than "unknown"). Monotonic versions make that
+			// late echo strictly older → dropped by isSupersededPush → never bound.
+			state.documentVersions.set(normalizedPath, version);
 			if (!isClientAlive(state)) return;
 			await safeSendNotification(state.connection, "textDocument/didOpen", {
-				textDocument: { uri, languageId, version: 0, text: content },
+				textDocument: { uri, languageId, version, text: content },
 			});
+			recordSentContent(state, normalizedPath, version, content);
 			state.openDocuments.add(normalizedPath);
+			state.openDocumentUris?.set(normalizedPath, uri);
 			return;
 		}
 		await safeSendNotification(state.connection, "textDocument/didChange", {
 			textDocument: { uri, version },
 			contentChanges: [{ text: content }],
 		});
+		recordSentContent(state, normalizedPath, version, content);
 		return;
 	}
 
@@ -1474,8 +1682,10 @@ export async function handleNotifyOpen(
 	await safeSendNotification(state.connection, "textDocument/didOpen", {
 		textDocument: { uri, languageId, version: 0, text: content },
 	});
+	recordSentContent(state, normalizedPath, 0, content);
 	state.pendingOpens.delete(normalizedPath);
 	state.openDocuments.add(normalizedPath);
+	state.openDocumentUris?.set(normalizedPath, uri);
 }
 
 export async function handleNotifyChange(
@@ -1484,8 +1694,8 @@ export async function handleNotifyChange(
 	content: string,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
-	const uri = pathToFileURL(filePath).href;
 	const normalizedPath = normalizeMapKey(filePath);
+	const uri = state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
 	if (!state.openDocuments.has(normalizedPath)) {
 		// Safety fallback: keep protocol ordering valid even if caller sends
@@ -1494,7 +1704,9 @@ export async function handleNotifyChange(
 			textDocument: { uri, languageId: "plaintext", version: 0, text: content },
 		});
 		state.documentVersions.set(normalizedPath, 0);
+		recordSentContent(state, normalizedPath, 0, content);
 		state.openDocuments.add(normalizedPath);
+		state.openDocumentUris?.set(normalizedPath, uri);
 		return;
 	}
 
@@ -1507,6 +1719,7 @@ export async function handleNotifyChange(
 		textDocument: { uri, version },
 		contentChanges: [{ text: content }],
 	});
+	recordSentContent(state, normalizedPath, version, content);
 }
 
 export async function clientShutdown(
@@ -1523,6 +1736,7 @@ export async function clientShutdown(
 	state.pendingDiagnostics.clear();
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
+	state.openDocumentUris?.clear();
 	// #271: drop any pending watched-files batch + its timer (a dying client's
 	// queued FS changes are moot, and the timer must not outlive the connection).
 	state.watchQueue?.cancel();
@@ -1675,6 +1889,7 @@ export async function runServerCommand(
 	command: string,
 	args: unknown[] | undefined,
 	timeoutMs: number = EXECUTE_COMMAND_TIMEOUT_MS,
+	mutationContext?: LspMutationContext,
 ): Promise<{ executed: boolean; result?: unknown; reason?: string }> {
 	if (!isClientAlive(state)) {
 		return { executed: false, reason: "lsp client not alive" };
@@ -1686,6 +1901,9 @@ export async function runServerCommand(
 		};
 	}
 	state.serverEditsAllowed += 1;
+	state.activeMutationDepth = (state.activeMutationDepth ?? 0) + 1;
+	if (state.activeMutationDepth === 1) state.activeMutationContext = mutationContext;
+	else state.activeMutationContext = undefined;
 	try {
 		let result: unknown;
 		try {
@@ -1712,16 +1930,87 @@ export async function runServerCommand(
 		return { executed: true, result };
 	} finally {
 		state.serverEditsAllowed -= 1;
+		state.activeMutationDepth = Math.max(0, (state.activeMutationDepth ?? 0) - 1);
+		if (state.activeMutationDepth === 0) state.activeMutationContext = undefined;
 	}
+}
+
+function validateWorkspaceEditVersions(
+	state: LSPClientState,
+	edit: { documentChanges?: unknown[] },
+): void {
+	for (const change of edit.documentChanges ?? []) {
+		if (typeof change !== "object" || change === null || !("textDocument" in change)) continue;
+		const textDocument = (change as { textDocument?: { uri?: unknown; version?: unknown } }).textDocument;
+		if (!textDocument || typeof textDocument.uri !== "string" || textDocument.version == null) continue;
+		const current = state.documentVersions.get(normalizeMapKey(uriToPath(textDocument.uri)));
+		if (current === undefined || current !== textDocument.version) {
+			throw new Error(`stale workspace edit document version for ${textDocument.uri}`);
+		}
+	}
+}
+
+// Neutralize numeric `textDocument.version` stamps AFTER they have been
+// validated against the live document map. The tool apply paths (rename
+// apply:true in tools/lsp-navigation.ts, code-action autofix in
+// actionable-warnings.ts) call applyWorkspaceEdit without a documentVersions
+// map, so a preserved numeric version would fail preflight 100% of the time for
+// servers that stamp real versions (gopls stamps open documents). Setting the
+// version to null is the spec's "do not check" — the freshness guarantee has
+// already been provided here by validateWorkspaceEditVersions at the correct
+// moment. The server-initiated workspace/applyEdit handler does NOT route
+// through here (it applies params.edit directly with state.documentVersions),
+// so its real preflight version check is left fully intact.
+function stripDocumentVersions(edit: LSPWorkspaceEdit): LSPWorkspaceEdit {
+	if (!Array.isArray(edit.documentChanges)) return edit;
+	const documentChanges = edit.documentChanges.map((change) => {
+		if (
+			typeof change === "object" &&
+			change !== null &&
+			"textDocument" in change &&
+			"edits" in change
+		) {
+			const textDocument = (change as { textDocument?: { version?: unknown } })
+				.textDocument;
+			if (textDocument && typeof textDocument.version === "number") {
+				return {
+					...(change as Record<string, unknown>),
+					textDocument: { ...textDocument, version: null },
+				};
+			}
+		}
+		return change;
+	});
+	return { ...edit, documentChanges } as LSPWorkspaceEdit;
+}
+
+export async function normalizeClientWorkspaceEdit(
+	state: LSPClientState,
+	edit: LSPWorkspaceEdit,
+): Promise<LSPWorkspaceEdit> {
+	validateWorkspaceEditVersions(state, edit);
+	const normalized = (await normalizeWorkspaceEditToUtf16(
+		edit,
+		state.positionEncoding,
+		state.root,
+	)) as LSPWorkspaceEdit;
+	return stripDocumentVersions(normalized);
 }
 
 async function resolveCodeActionBestEffort(
 	state: LSPClientState,
 	action: LSPCodeAction,
 ): Promise<LSPCodeAction> {
-	if (!isClientAlive(state) || action.edit) return action;
+	if (!isClientAlive(state)) return action;
+	if (action.edit) {
+		return {
+			...action,
+			edit: await normalizeClientWorkspaceEdit(state, action.edit as LSPWorkspaceEdit),
+		};
+	}
+	let resolved: LSPCodeAction | null | undefined;
 	try {
-		const resolved = await withTimeout(
+		resolved = await withTimeout(
 			safeSendRequest<LSPCodeAction>(
 				state.connection,
 				"codeAction/resolve",
@@ -1729,13 +2018,16 @@ async function resolveCodeActionBestEffort(
 			),
 			NAV_REQUEST_TIMEOUT_MS,
 		);
-		if (!resolved || typeof resolved !== "object") return action;
-		return { ...action, ...resolved };
 	} catch {
 		// codeAction/resolve is optional. Keep the original lightweight action when
 		// the server does not support resolve or fails to populate an edit.
 		return action;
 	}
+	if (!resolved || typeof resolved !== "object") return action;
+	const merged = { ...action, ...resolved };
+	return merged.edit
+		? { ...merged, edit: await normalizeClientWorkspaceEdit(state, merged.edit as LSPWorkspaceEdit) }
+		: merged;
 }
 
 // --- Client Factory ---
@@ -1895,6 +2187,7 @@ export async function createLSPClient(options: {
 		isConnected: true,
 		isDestroyed: false,
 		shutdownRequested: false,
+		exitedAt: undefined,
 		connectionDisposed: false,
 		lastError: undefined,
 		connection,
@@ -1907,7 +2200,10 @@ export async function createLSPClient(options: {
 		diagnosticsVersion: 0,
 		documentVersions: new Map(),
 		diagnosticDocVersions: new Map(),
+		documentContentHashes: new Map(),
+		diagnosticBindings: new Map(),
 		openDocuments: new Set(),
+		openDocumentUris: new Map(),
 		pendingOpens: new Set(),
 		// these are filled in after initialize — cast to avoid two-phase init
 		workspaceDiagnosticsSupport:
@@ -1918,6 +2214,7 @@ export async function createLSPClient(options: {
 		dynamicRegistrations: new Map(),
 		advertisedCommands: new Set(),
 		serverEditsAllowed: 0,
+		activeMutationDepth: 0,
 		serverId,
 		launchVariant,
 		root,
@@ -1975,7 +2272,24 @@ export async function createLSPClient(options: {
 			});
 		});
 		setTimeout(() => {
-			if (!lspProcess.process.killed && process.platform !== "win32") {
+			// #1114: gate on the process's own observed `exitCode`/`signalCode`,
+			// not `.killed` — `killProcessTree` above signals the POSIX process
+			// GROUP via the raw `process.kill(-pid, …)`, which never touches
+			// this `ChildProcess` instance's `.killed` flag, so `!…killed` here
+			// was always true and this 2s backstop unconditionally re-sent
+			// SIGKILL even when the group had already exited. `exitCode` alone
+			// is insufficient too: a process that died FROM a signal (the
+			// common case here — killProcessTree's own SIGTERM/SIGKILL) has
+			// `exitCode === null` forever and only `signalCode` set, so
+			// checking `exitCode === null` alone still re-SIGKILLs that corpse
+			// on the common path (harmless — `kill()` on an already-exited pid
+			// is a swallowed no-op — but not actually "observed still alive").
+			// Require both null to mean "no exit observed by either signal".
+			if (
+				lspProcess.process.exitCode === null &&
+				lspProcess.process.signalCode === null &&
+				process.platform !== "win32"
+			) {
 				lspProcess.process.kill("SIGKILL");
 			}
 		}, 2000);
@@ -2042,6 +2356,12 @@ export async function createLSPClient(options: {
 			lspProcess.process.exitCode !== null ||
 			(lspProcess.process as { killed?: boolean }).killed === true,
 
+		/** #1127: mirrors `state.shutdownRequested` — see interface doc. */
+		wasShutdownIntentional: () => state.shutdownRequested,
+
+		/** #1127: mirrors `state.exitedAt` — see interface doc. */
+		getExitedAt: () => state.exitedAt,
+
 		/** Last N lines of server stderr for diagnostics. */
 		recentStderr: (lines?: number) => recentStderr(lines),
 
@@ -2068,8 +2388,15 @@ export async function createLSPClient(options: {
 			return getMergedDiagnosticsForPath(state, normalizeMapKey(filePath));
 		},
 
+		getDiagnosticBinding(filePath) {
+			return state.diagnosticBindings.get(normalizeMapKey(filePath));
+		},
+
 		getAllDiagnostics() {
-			const result = new Map<string, { diags: LSPDiagnostic[]; ts: number }>();
+			const result = new Map<
+				string,
+				{ diags: LSPDiagnostic[]; ts: number; binding?: StoredDiagnosticBinding }
+			>();
 			const keys = new Set([
 				...state.pushDiagnostics.keys(),
 				...state.documentPullDiagnostics.keys(),
@@ -2081,18 +2408,19 @@ export async function createLSPClient(options: {
 						state.pushDiagnosticTimestamps.get(key) ?? 0,
 						state.documentPullDiagnosticTimestamps.get(key) ?? 0,
 					),
+					binding: state.diagnosticBindings.get(key),
 				});
 			}
 			return result;
 		},
 
 		getTrackedDiagnosticPaths() {
-			return [
-				...new Set([
-					...state.pushDiagnostics.keys(),
-					...state.documentPullDiagnostics.keys(),
-				]),
-			];
+			return [...new Set([
+				...state.pushDiagnostics.keys(),
+				...state.documentPullDiagnostics.keys(),
+			])].map((filePath) =>
+				process.platform === "win32" ? filePath.replace(/\//g, "\\") : filePath,
+			);
 		},
 
 		pruneDiagnostics(predicate) {
@@ -2138,8 +2466,14 @@ export async function createLSPClient(options: {
 			return state.launchVariant;
 		},
 
-		async executeCommand(command, args) {
-			return runServerCommand(state, command, args);
+		async executeCommand(command, args, mutationContext) {
+			return runServerCommand(
+				state,
+				command,
+				args,
+				EXECUTE_COMMAND_TIMEOUT_MS,
+				mutationContext,
+			);
 		},
 
 		get diagnosticsVersion() {
@@ -2250,6 +2584,10 @@ export async function createLSPClient(options: {
 			return state.openDocuments.has(normalizeMapKey(filePath));
 		},
 
+		getDocumentUri(filePath) {
+			return state.openDocumentUris?.get(normalizeMapKey(filePath));
+		},
+
 		async workspaceSymbol(query) {
 			if (!isClientAlive(state)) return [];
 			// Route through navRequest for the shared withTimeout ceiling — a hung
@@ -2306,7 +2644,22 @@ export async function createLSPClient(options: {
 				},
 				filePath,
 			);
-			return result ?? null;
+			return result ? await normalizeClientWorkspaceEdit(state, result) : null;
+		},
+
+		async closeDocument(filePath) {
+			if (!isClientAlive(state)) return;
+			const normalizedPath = normalizeMapKey(filePath);
+			if (!state.openDocuments.has(normalizedPath)) return;
+			await safeSendNotification(state.connection, "textDocument/didClose", {
+				textDocument: {
+					uri: state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href,
+				},
+			});
+			state.openDocuments.delete(normalizedPath);
+			state.openDocumentUris?.delete(normalizedPath);
+			state.documentVersions.delete(normalizedPath);
+			clearDiagnosticsForPath(state, normalizedPath);
 		},
 
 		async willRenameFiles(oldFilePath, newFilePath) {
@@ -2322,16 +2675,16 @@ export async function createLSPClient(options: {
 					],
 				},
 			);
-			return result ?? null;
+			return result ? await normalizeClientWorkspaceEdit(state, result) : null;
 		},
 
-		async didRenameFiles(oldFilePath, newFilePath) {
+		async didRenameFiles(oldFilePath, newFilePath, oldUri, newUri) {
 			if (!isClientAlive(state)) return;
 			await safeSendNotification(state.connection, "workspace/didRenameFiles", {
 				files: [
 					{
-						oldUri: pathToFileURL(oldFilePath).href,
-						newUri: pathToFileURL(newFilePath).href,
+						oldUri: oldUri ?? pathToFileURL(oldFilePath).href,
+						newUri: newUri ?? pathToFileURL(newFilePath).href,
 					},
 				],
 			});

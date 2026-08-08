@@ -4,6 +4,7 @@ import {
 	type ImpactResult,
 	type SymbolKey,
 } from "../../call-graph.js";
+import { isTestRoleCollateral } from "../../collateral-test-role.js";
 import type { ProjectDiagnostic } from "../types.js";
 
 /**
@@ -114,6 +115,13 @@ export function callGraphImpactToProjectDiagnostics(
 			const { filePath } = parseSymbolKey(result.symbolKey);
 			if (!filePath) continue; // Nothing real to attribute this to.
 			const resolvedFile = resolveImpactFile(cwd, filePath);
+
+			// #1080: the call graph is derived from the tests-free review graph and is
+			// normally tests-free, but this adapter accepts arbitrary caller
+			// symbol keys — an old/fixture/expanded graph could supply a test-file
+			// caller. A KNOWN test-role caller must not be persisted as collateral
+			// call-graph impact. Fail-open: a classifier error retains the finding.
+			if (isTestRoleCollateral(resolvedFile)) continue;
 
 			const dedupeKey = `${resolvedFile}:${result.symbolKey}`;
 			const existing = byKey.get(dedupeKey);

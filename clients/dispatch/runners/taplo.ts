@@ -13,6 +13,7 @@ import {
 	lspPrimaryCoversFile,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
 
 const taplo = createAvailabilityChecker("taplo", ".exe");
 
@@ -86,7 +87,7 @@ const taploRunner: RunnerDefinition = {
 			{ cwd, timeout: 15000 },
 		);
 
-		if (result.error && !result.stdout) {
+		if (spawnFailedWithNoOutput(result)) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

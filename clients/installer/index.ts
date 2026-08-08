@@ -318,7 +318,9 @@ export interface PlatformPackageSpec {
  * the copy-pasted `if (platform === "linux") return arch === "arm64" ? … : …`
  * ladder that several release entries repeat verbatim. Each platform maps to its
  * `x64` (default) and optional `arm64` asset substring; a missing platform or
- * arch ⇒ unsupported (`undefined`), exactly as the hand-written ladders behaved.
+ * arch ⇒ unsupported (`undefined`). Arches outside x64/arm64 (ia32, ppc64, …)
+ * are unsupported too — no release entry ships a 32-bit or exotic asset, and
+ * handing back the x64 substring there would install an unrunnable binary.
  */
 function archAssetMatch(table: {
 	linux?: { x64?: string; arm64?: string };
@@ -326,11 +328,19 @@ function archAssetMatch(table: {
 	win32?: { x64?: string; arm64?: string };
 }): (platform: string, arch: string) => string | undefined {
 	return (platform, arch) => {
-		const entry = table[platform as "linux" | "darwin" | "win32"];
-		if (!entry) return undefined;
-		return arch === "arm64" ? entry.arm64 : entry.x64;
+		if (arch !== "x64" && arch !== "arm64") return undefined;
+		return table[platform as "linux" | "darwin" | "win32"]?.[arch];
 	};
 }
+
+// Go-style `<os>_<arch>.zip` release assets, shared verbatim by tflint and
+// terraform-ls — both entries carried byte-identical ladders, down to the asset
+// strings themselves.
+const OS_ARCH_ZIP_ASSETS = {
+	linux: { x64: "linux_amd64.zip", arm64: "linux_arm64.zip" },
+	darwin: { x64: "darwin_amd64.zip", arm64: "darwin_arm64.zip" },
+	win32: { x64: "windows_amd64.zip", arm64: "windows_arm64.zip" },
+};
 
 export const TOOLS: ToolDefinition[] = [
 	// Core LSP servers
@@ -1053,16 +1063,37 @@ export const TOOLS: ToolDefinition[] = [
 		binaryName: "tflint",
 		github: {
 			repo: "terraform-linters/tflint",
-			assetMatch: (platform, arch) => {
-				if (platform === "linux")
-					return arch === "arm64" ? "linux_arm64.zip" : "linux_amd64.zip";
-				if (platform === "darwin")
-					return arch === "arm64" ? "darwin_arm64.zip" : "darwin_amd64.zip";
-				if (platform === "win32")
-					return arch === "arm64" ? "windows_arm64.zip" : "windows_amd64.zip";
-				return undefined;
-			},
+			assetMatch: archAssetMatch(OS_ARCH_ZIP_ASSETS),
 			binaryInArchive: "tflint",
+		},
+	},
+	{
+		// Terragrunt ships a bare native binary per platform on GitHub releases.
+		// Windows arm64 uses the x64 binary through Windows' built-in emulation —
+		// there is no terragrunt_windows_arm64.exe upstream.
+		id: "terragrunt",
+		name: "terragrunt",
+		checkCommand: "terragrunt",
+		checkArgs: ["--version"],
+		installStrategy: "github",
+		binaryName: "terragrunt",
+		github: {
+			repo: "gruntwork-io/terragrunt",
+			assetMatch: archAssetMatch({
+				linux: {
+					x64: "terragrunt_linux_amd64",
+					arm64: "terragrunt_linux_arm64",
+				},
+				darwin: {
+					x64: "terragrunt_darwin_amd64",
+					arm64: "terragrunt_darwin_arm64",
+				},
+				win32: {
+					x64: "terragrunt_windows_amd64.exe",
+					arm64: "terragrunt_windows_amd64.exe",
+				},
+			}),
+			// bare binary — no binaryInArchive
 		},
 	},
 	{
@@ -1186,15 +1217,7 @@ export const TOOLS: ToolDefinition[] = [
 		github: {
 			repo: "hashicorp/terraform-ls",
 			hashiCorpReleaseProduct: "terraform-ls",
-			assetMatch: (platform, arch) => {
-				if (platform === "linux")
-					return arch === "arm64" ? "linux_arm64.zip" : "linux_amd64.zip";
-				if (platform === "darwin")
-					return arch === "arm64" ? "darwin_arm64.zip" : "darwin_amd64.zip";
-				if (platform === "win32")
-					return arch === "arm64" ? "windows_arm64.zip" : "windows_amd64.zip";
-				return undefined;
-			},
+			assetMatch: archAssetMatch(OS_ARCH_ZIP_ASSETS),
 			binaryInArchive: "terraform-ls",
 		},
 	},
@@ -2464,7 +2487,7 @@ async function installGitHubTool(
 	}
 
 	const asset =
-		releaseJson.assets.find((a) => a.name.includes(assetSubstring)) ??
+		pickReleaseAsset(releaseJson.assets, assetSubstring) ??
 		deriveHashiCorpReleaseAsset(tool, releaseJson.tag_name, assetSubstring);
 	if (!asset) {
 		logSessionStart(
@@ -3660,6 +3683,7 @@ export const GITHUB_TOOLS = [
 	"zizmor",
 	"typos-lsp",
 	"tflint",
+	"terragrunt",
 	"terraform-ls",
 	"zls",
 	"hadolint",
@@ -3715,6 +3739,36 @@ export function resolveGitHubArchiveBinaryCandidates(
 }
 
 type DownloadAsset = { name: string; browser_download_url: string };
+
+// Signature/checksum siblings a release publishes next to the real asset. A
+// bare-binary tool's substring IS the whole asset name, so `includes` alone
+// matches `<asset>.asc` too and would install a signature file as the binary.
+const ASSET_SIDECAR_SUFFIXES = [
+	".asc",
+	".sig",
+	".minisig",
+	".pem",
+	".cert",
+	".sbom",
+	".sha256",
+	".sha256sum",
+	".md5",
+];
+
+function isAssetSidecar(name: string): boolean {
+	const lower = name.toLowerCase();
+	return ASSET_SIDECAR_SUFFIXES.some((suffix) => lower.endsWith(suffix));
+}
+
+export function pickReleaseAsset<T extends { name: string }>(
+	assets: T[],
+	assetSubstring: string,
+): T | undefined {
+	return (
+		assets.find((a) => a.name === assetSubstring) ??
+		assets.find((a) => a.name.includes(assetSubstring) && !isAssetSidecar(a.name))
+	);
+}
 
 function deriveHashiCorpReleaseAsset(
 	tool: ToolDefinition,

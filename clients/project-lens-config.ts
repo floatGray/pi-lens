@@ -385,11 +385,18 @@ function parseRulePolicyList(
 		if (trimmed.length > 0) list.push(trimmed);
 	}
 	if (list.length === 0) {
-		warnInvalidConfigOnce(
-			configPath,
-			`rules.${ruleId}.${key} must be a non-empty array of strings`,
-		);
-		return { list: [], invalid: true };
+		// #1087: an explicitly empty array (`"disable": []`) is a well-formed
+		// no-op, not an error — don't warn. Only warn when the array HAD entries
+		// but none were usable strings (all blank / non-string), which is a real
+		// authoring mistake that must not fail silently.
+		if (value.length > 0) {
+			warnInvalidConfigOnce(
+				configPath,
+				`rules.${ruleId}.${key} must contain at least one non-empty string`,
+			);
+			return { list: [], invalid: true };
+		}
+		return { list: [], invalid: false };
 	}
 	return { list, invalid: false };
 }
@@ -459,7 +466,10 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 					"disable",
 					r.disable,
 				);
-				if (!parsed.invalid) entry.disable = parsed.list;
+				// #1087: an explicitly empty list is valid-but-empty (no warning);
+				// don't store a pointless no-op entry for it.
+				if (!parsed.invalid && parsed.list.length > 0)
+					entry.disable = parsed.list;
 			}
 			if ("select" in r) {
 				const parsed = parseRulePolicyList(
@@ -468,7 +478,8 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 					"select",
 					r.select,
 				);
-				if (!parsed.invalid) entry.select = parsed.list;
+				if (!parsed.invalid && parsed.list.length > 0)
+					entry.select = parsed.list;
 			}
 			// Honor both threshold-only and policy-only entries; only drop if
 			// the entry had no recognized fields at all (e.g. { unrelated: true }).

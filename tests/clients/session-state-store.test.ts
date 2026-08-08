@@ -3,15 +3,24 @@
  * widget-state export/import that backs resume rehydration.
  */
 
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { getProjectDataDir } from "../../clients/file-utils.js";
 import {
 	dropStaleFiles,
 	loadSessionState,
 	saveSessionState,
 	sessionStartMode,
+	STATE_VERSION,
 } from "../../clients/session-state-store.js";
 import { createReadGuard } from "../../clients/read-guard.js";
 import {
@@ -140,6 +149,30 @@ describe("session-state-store save/load (#190)", () => {
 		const loaded = await loadSessionState(cwd, "forked-session");
 		expect(importWidgetState(loaded?.widget)).toBe(true);
 		expect(getFileDiagnosticSummaries()).toEqual(before);
+	});
+
+	it("rejects and ignores a persisted snapshot whose version does not match STATE_VERSION (#1106)", async () => {
+		seedDiagnostics();
+		await saveSessionState(cwd, "wrong-version-session", exportWidgetState());
+
+		// Sanity: the freshly-saved snapshot loads fine at the current version.
+		const before = await loadSessionState(cwd, "wrong-version-session");
+		expect(before?.version).toBe(STATE_VERSION);
+
+		// Corrupt the on-disk version to a deliberate mismatch (never a hardcoded
+		// literal — #1116 pattern) and confirm the reject path is taken: the
+		// caller sees `undefined`, exactly like a missing/corrupt file.
+		const sessionsDir = join(getProjectDataDir(cwd), "sessions");
+		const [file] = readdirSync(sessionsDir).filter((f) =>
+			f.includes("wrong-version-session"),
+		);
+		const filePath = join(sessionsDir, file);
+		const raw = JSON.parse(readFileSync(filePath, "utf-8"));
+		raw.version = STATE_VERSION + 1;
+		writeFileSync(filePath, JSON.stringify(raw));
+
+		const loaded = await loadSessionState(cwd, "wrong-version-session");
+		expect(loaded).toBeUndefined();
 	});
 
 	it("isolates sessions: one id's state does not leak into another", async () => {

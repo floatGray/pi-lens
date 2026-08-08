@@ -55,6 +55,11 @@ const TREE_SITTER_MAX_SCAN_FILES = 20_000;
 // instead of paying the 3.3x per-rule fallback for the process lifetime (#889).
 const QUERY_BATCH_MAX_LOAD_FAILURES = 3;
 
+// Keep post-filter tree walks bounded. A malformed or unexpectedly huge tree
+// must not stall the batched query walk; the filter fails open when this cap
+// is reached so unrelated diagnostics and the current match are preserved.
+const NO_NESTED_ANCHOR_VISIT_CAP = 10_000;
+
 // --- Type Declarations (local, no import needed) ---
 
 // biome-ignore lint/suspicious/noExplicitAny: Language from web-tree-sitter
@@ -215,6 +220,37 @@ export class TreeSitterClient {
 			this.onWasmAbort?.();
 		}
 		return true;
+	}
+
+	/**
+	 * O(1) runtime footprint counters (#1123 item 2 memory attribution): every
+	 * field is a `Map.size` read, never an iteration over the maps' contents.
+	 * `wasmMemoryBytes` is deliberately NOT included here — web-tree-sitter
+	 * 0.25.10's Emscripten `Module` (which owns the WASM linear memory /
+	 * `HEAPU8.buffer`) is a private closure variable in the package's
+	 * `bindings.ts` and is not exposed through any public export (`Parser`,
+	 * `Language`, `Query`, ...); reaching it would require either reflecting
+	 * into the package's internal module state (brittle across web-tree-sitter
+	 * versions/bundling) or overriding Emscripten's `wasmMemory` module option
+	 * at `Parser.init()` time with a hand-constructed `WebAssembly.Memory`
+	 * matching the library's own default page-count math (risks a memory-import
+	 * mismatch that would break ALL structural analysis, for an
+	 * observability-only feature). `process.memoryUsage().arrayBuffers` is the
+	 * process-wide proxy used instead (WASM linear memory backs an ArrayBuffer,
+	 * so it is included there) — see clients/memory-sampler.ts.
+	 */
+	getRuntimeStats(): {
+		languagesLoaded: number;
+		parsersLoaded: number;
+		queryCacheSize: number;
+		queryBatchCacheSize: number;
+	} {
+		return {
+			languagesLoaded: this.languages.size,
+			parsersLoaded: this.parsers.size,
+			queryCacheSize: this.queryCache.size,
+			queryBatchCacheSize: this.queryBatchCache.size,
+		};
 	}
 
 	getParseCacheStats(): TreeSitterParseCacheStats {
@@ -1911,7 +1947,88 @@ export class TreeSitterClient {
 			return slots;
 		}
 
+		/**
+		 * Escape a string for safe interpolation into a `RegExp` source —
+		 * needed anywhere an identifier's raw text is combined with regex
+		 * metacharacters like `\b` word boundaries (see
+		 * "not_closed_or_try_with_resources" below; #1089 P2).
+		 */
+		function escapeRegExp(s: string): string {
+			return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		}
+
 		switch (postFilter) {
+			case "no_nested_anchor_chain": {
+				// Tree-sitter queries can express the opening-tag shape, but they
+				// cannot express both an arbitrary-depth descendant relationship and
+				// an ancestor exclusion. Walk the captured JSX element here so the
+				// TSX path agrees with the ast-grep rule: keep exactly the outermost
+				// anchor that contains another anchor, including through wrappers.
+				// This post-filter runs inside a batched query walk. It must never
+				// abort that walk or turn a malformed tree into a false negative.
+				try {
+					const outer = captures.OUTER_ELEMENT;
+					if (!outer) {
+						this.reportPostFilterFailure(
+							postFilter,
+							"missing OUTER_ELEMENT capture",
+						);
+						return true;
+					}
+					const isAnchorElement = (node: TreeSitterNode): boolean => {
+						if (node.type !== "jsx_element") return false;
+						const opening =
+							node.childForFieldName?.("open_tag") ??
+							node.children?.find(
+								(child) => child.type === "jsx_opening_element",
+							);
+						const name =
+							opening?.childForFieldName?.("name") ??
+							opening?.children?.find(
+								(child) => child.type === "identifier",
+							);
+						return name?.text === "a";
+					};
+
+					let visited = 0;
+					let ancestor = outer.parent;
+					while (ancestor) {
+						if (++visited > NO_NESTED_ANCHOR_VISIT_CAP) {
+							this.reportPostFilterFailure(
+								postFilter,
+								`ancestor walk exceeded ${NO_NESTED_ANCHOR_VISIT_CAP} nodes`,
+							);
+							return true;
+						}
+						if (isAnchorElement(ancestor)) return false;
+						ancestor = ancestor.parent;
+					}
+
+					const pending = [...(outer.children ?? [])];
+					while (pending.length > 0) {
+						const node = pending.pop();
+						if (!node) continue;
+						if (++visited > NO_NESTED_ANCHOR_VISIT_CAP) {
+							this.reportPostFilterFailure(
+								postFilter,
+								`descendant walk exceeded ${NO_NESTED_ANCHOR_VISIT_CAP} nodes`,
+							);
+							return true;
+						}
+						if (isAnchorElement(node)) return true;
+						pending.push(...(node.children ?? []));
+					}
+					return false;
+				} catch (error) {
+					const reason =
+						error instanceof Error ? error.message : String(error);
+					this.reportPostFilterFailure(
+						postFilter,
+						`tree walk failed${reason ? `: ${reason}` : ""}`,
+					);
+					return true;
+				}
+			}
 			case "differs_only_by_case": {
 				try {
 					const field = captures.FIELD?.text ?? "";
@@ -2015,7 +2132,13 @@ export class TreeSitterClient {
 							"block",
 						]) ?? rootNode;
 					if (!scope) return true;
-					const resourceWord = new RegExp(`\b${resource}\b`);
+					// `\b` in a template literal is the BACKSPACE control char
+					// (U+0008), not a regex word-boundary escape — that requires
+					// the literal two-character sequence `\\b`. The identifier
+					// itself must also be regex-escaped (#1089 P2).
+					const resourceWord = new RegExp(
+						`\\b${escapeRegExp(resource)}\\b`,
+					);
 					const stack = [scope];
 					for (let visited = 0; stack.length > 0 && visited < 10_000; visited++) {
 						const node = stack.pop();
@@ -3171,6 +3294,17 @@ export class TreeSitterClient {
 	}
 
 	private reportedMissingPostFilters = new Set<string>();
+	private reportedPostFilterFailures = new Set<string>();
+
+	/** Keep a failed post-filter match and leave a bounded diagnostic trail. */
+	private reportPostFilterFailure(postFilter: string, reason: string): void {
+		if (this.reportedPostFilterFailures.has(postFilter)) return;
+		this.reportedPostFilterFailures.add(postFilter);
+		console.error(
+			`[pi-lens] tree-sitter rule post_filter '${postFilter}' failed — ` +
+				`keeping the diagnostic (fail-open): ${reason}.`,
+		);
+	}
 
 	/** Warn once per unimplemented post_filter — a silent rule needs a trail. */
 	private reportMissingPostFilter(postFilter: string): void {

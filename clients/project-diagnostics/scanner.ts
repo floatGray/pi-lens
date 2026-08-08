@@ -18,7 +18,10 @@ import { captureReviewGraphStructuralIr } from "../review-graph/builder.js";
 import { publishReviewGraphFileIr,
 	reviewGraphIrContentHash,
 } from "../review-graph/shared-extraction-ir.js";
-import { collectSourceFilesWithBudgetAsync } from "../source-filter.js";
+import {
+	collectSourceFilesWithBudgetAsync,
+	type SourceCollectionResult,
+} from "../source-filter.js";
 import {
 	logTreeSitter,
 	logTreeSitterCacheStats,
@@ -410,11 +413,19 @@ export async function scanProjectDiagnostics(
 	// trips `maxFiles`. Unlike `unsafeRoot` this is not a refusal: when the
 	// budget trips we scan the truncated best-effort list and flag the snapshot
 	// so callers don't read the partial result as a complete sweep.
-	const collected = options.files
+	// #1107 phase 2: typed as the full `SourceCollectionResult` (not just its
+	// `{files, entryBudgetExceeded}` shape) so the generated-skip counters
+	// below are readable through the ternary — the `options.files` branch
+	// legitimately never walked, so it leaves them `undefined`, same
+	// convention as `entryBudgetExceeded: false` above it.
+	const collected: SourceCollectionResult = options.files
 		? { files: options.files.slice(0, maxFiles), entryBudgetExceeded: false }
 		: await collectSourceFilesWithBudgetAsync(cwd, {
 				maxFiles,
 				maxScanEntries: options.maxScanEntries,
+				// #1107 phase 2 review: the actionable opt-out generatedSkipNotice
+				// points a user at.
+				includeGenerated: options.includeGenerated === true,
 			});
 	const files = collected.files;
 	// Check cancellation before and during the file-major pass so a full-mode
@@ -447,6 +458,18 @@ export async function scanProjectDiagnostics(
 	// #760: only present when true — keeps existing snapshots/serializations
 	// byte-identical for the untruncated (normal) case.
 	if (collected.entryBudgetExceeded) snapshot.scanTruncated = true;
+	// #1107 phase 2: only present when nonzero, same convention as the
+	// truncation flag above — a healthy scan with no generated-name skips
+	// produces a byte-identical snapshot to before this change.
+	if (collected.generatedOrArtifactSkips) {
+		snapshot.generatedFileSkips = collected.generatedOrArtifactSkips;
+	}
+	if (collected.generatedNameOnlySkips) {
+		snapshot.generatedNameOnlySkips = collected.generatedNameOnlySkips;
+	}
+	if (collected.generatedDirSkips) {
+		snapshot.generatedDirSkips = collected.generatedDirSkips;
+	}
 	if (wasmAborted) {
 		snapshot.scanTruncated = true;
 		snapshot.treeSitterStatus = "wasm_aborted_restart_required";

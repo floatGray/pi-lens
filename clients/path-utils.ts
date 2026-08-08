@@ -14,14 +14,20 @@
 import { type Dirent, existsSync, realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { dirname, win32 } from "node:path";
+import { win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { minimatch } from "./deps/minimatch.js";
 
 /**
- * Detect if a path is a Windows path (has drive letter or UNC prefix).
+ * Detect if a path is a Windows path (has drive letter or UNC prefix), by
+ * SHAPE — true for a drive-letter/UNC-looking string regardless of the
+ * running OS. Exported (refs #1152) so shape-aware callers outside this
+ * module (e.g. `file-role.ts`'s `detectFileRole`) can branch to
+ * `path.win32.dirname`/`basename` for a Windows-shaped path even when
+ * `process.platform !== "win32"`, instead of the platform-default
+ * `dirname`/`basename` silently misparsing it (the #1150 class).
  */
-function isWindowsPath(filePath: string): boolean {
+export function isWindowsPath(filePath: string): boolean {
 	return /^[A-Za-z]:/.test(filePath) || filePath.startsWith("\\\\");
 }
 
@@ -93,7 +99,15 @@ function resolveNonExisting(filePath: string): string {
 			return base.endsWith("/") ? base + tail : `${base}/${tail}`;
 		}
 
-		const parent = dirname(current);
+		// Use win32.dirname (not the platform-default dirname) so a
+		// Windows-shaped path is parsed with win32 semantics regardless of the
+		// running OS — consistent with the win32.resolve/win32.normalize this
+		// branch already commits to. The platform-default POSIX dirname would
+		// find no separator in a win32-resolved "C:\repo\..." path (its only
+		// separators are backslashes), collapse to ".", stop the upward walk at
+		// cwd, and mangle the key on Linux CI (refs #1150, the #1024
+		// OS-divergence class).
+		const parent = win32.dirname(current);
 		if (parent === current) {
 			// Reached filesystem root without finding existing dir
 			// Fall back to full lowercase
@@ -120,6 +134,29 @@ export function uriToPath(uri: string): string {
 }
 
 /**
+ * Decode a file:// URI to an on-disk path WITHOUT map-key normalization.
+ *
+ * `uriToPath` runs its result through `normalizeFilePath`, which on win32
+ * lowercases the nonexistent tail of a path (see `resolveNonExisting`) and
+ * canonicalizes an existing path to its real casing. That is correct for Map
+ * keys, but DESTRUCTIVE for a real create/rename target: creating `NewFile.txt`
+ * would write `newfile.txt`, and a legitimate case-only rename would collapse
+ * to a no-op ("source and destination must differ"). Disk mutations must honor
+ * the caller's intended casing, so they resolve their target through this
+ * decode-only path while confinement/validation keep using the normalized
+ * `uriToPath`. Non-win32 is unaffected either way (normalizeFilePath is a
+ * near-identity there).
+ */
+export function uriToDiskPath(uri: string): string {
+	try {
+		return fileURLToPath(uri);
+	} catch {
+		// Not a valid file:// URI — treat as a plain path (matches uriToPath).
+		return uri;
+	}
+}
+
+/**
  * Convert a path to a file:// URI.
  * Does NOT normalize the path - URIs preserve original casing.
  */
@@ -135,11 +172,27 @@ export function normalizeMapKey(filePath: string): string {
 	return normalizeFilePath(filePath);
 }
 
-/** Human-facing path relative to a project root when the file is inside it. */
+/**
+ * Human-facing path relative to a project root when the file is inside it.
+ *
+ * Parses by path SHAPE, not host OS (refs #1150/#1152, shape-2 class #1163):
+ * a Windows-shaped `filePath` (drive-letter/UNC — e.g. a persisted call-graph
+ * symbol-key path `C:\repo\src\x.ts` rehydrated on a Linux CI run) is split
+ * with `win32.*` regardless of `process.platform`. The host-default
+ * `isAbsolute`/`relative` find no drive-letter anchor in a win32 path on POSIX:
+ * `path.isAbsolute("C:\\repo\\x.ts")` returns FALSE on Linux, short-circuiting
+ * to the raw absolute path instead of ever relativizing it — so a file that IS
+ * under the project root renders as a full absolute path on Linux but the
+ * expected `src/x.ts` on Windows (green-locally / wrong-on-CI, the #1024
+ * divergence class). `win32.*` on a native POSIX path (Windows never sees one;
+ * Linux native paths aren't Windows-shaped) is never selected, so same-OS
+ * native paths are unchanged either way.
+ */
 export function toProjectRelativePath(filePath: string, projectRoot: string): string {
-	if (!path.isAbsolute(filePath)) return filePath.replace(/\\/g, "/");
-	const relative = path.relative(path.resolve(projectRoot), filePath);
-	return relative && !relative.startsWith("..") && !path.isAbsolute(relative)
+	const p = isWindowsPath(filePath) ? win32 : path;
+	if (!p.isAbsolute(filePath)) return filePath.replace(/\\/g, "/");
+	const relative = p.relative(p.resolve(projectRoot), filePath);
+	return relative && !relative.startsWith("..") && !p.isAbsolute(relative)
 		? relative.replace(/\\/g, "/")
 		: filePath.replace(/\\/g, "/");
 }

@@ -26,7 +26,7 @@
  * snapshot's `workspaceDiagnosticsSupport.mode` (from
  * `detectWorkspaceDiagnosticsSupport`, cached at `initialize`) and combines it
  * with the `silentOnClean` marker on that server's `DiagnosticStrategy`
- * (`server-strategies.ts`) — the same per-server behavioral-knowledge table
+ * (`wait-policy/strategies.ts`) — the same per-server behavioral-knowledge table
  * the rest of the LSP layer already uses. A server with no live snapshot yet,
  * or whose mode isn't `push-only`, or that isn't marked `silentOnClean`, is
  * NOT tier-3 — the caller keeps today's full in-lane wait. Fail-safe is

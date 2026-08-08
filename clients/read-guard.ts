@@ -106,7 +106,7 @@ export interface PersistedReadGuardState {
 	reads: Array<[string, ReadRecord[]]>;
 }
 
-const READ_GUARD_STATE_VERSION = 1;
+export const READ_GUARD_STATE_VERSION = 1;
 
 // --- Constants ---
 

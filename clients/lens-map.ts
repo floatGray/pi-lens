@@ -22,6 +22,7 @@ import { FactStore } from "./dispatch/fact-store.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { collectUntrackedIgnoredIds } from "./git-tracked-ignore.js";
 import { normalizeMapKey, toProjectRelativePath } from "./path-utils.js";
+import { canonicalSourceTwin } from "./source-filter.js";
 import { buildOrUpdateGraph } from "./review-graph/service.js";
 import type { ReviewGraph } from "./review-graph/types.js";
 import { detectFileRole } from "./file-role.js";
@@ -164,13 +165,10 @@ export function aggregateGraphToFiles(
 	// import edges). Deterministic sibling families: .js → .ts (preferred)
 	// then .tsx; .mjs → .mts; .cjs → .cts. A compiled-looking file with no
 	// source twin (vendored deps, pure-JS projects) is untouched.
-	const COMPILED_TWIN_SOURCES: ReadonlyArray<
-		readonly [compiledExt: string, sourceExts: readonly string[]]
-	> = [
-		[".js", [".ts", ".tsx"]],
-		[".mjs", [".mts"]],
-		[".cjs", [".cts"]],
-	];
+	// Keep this pure aggregation layer on the shared source-filter policy. It
+	// cannot call findSourceSibling because synthetic graph fixtures and cached
+	// nodes are not required to exist on disk.
+	const compiledExtensions = new Set([".js", ".jsx", ".mjs", ".cjs"]);
 	// Interplay with the untracked-gitignored exclusion (`excludeIds`):
 	// twin canonicalization takes PRECEDENCE over exclusion. An excluded
 	// compiled file whose source twin survives is merged onto that twin
@@ -183,18 +181,9 @@ export function aggregateGraphToFiles(
 	const excludeIds = options?.excludeIds;
 	const canonicalOf = new Map<string, string>();
 	for (const id of allFileIds) {
-		for (const [compiledExt, sourceExts] of COMPILED_TWIN_SOURCES) {
-			if (!id.endsWith(compiledExt)) continue;
-			const stem = id.slice(0, id.length - compiledExt.length);
-			for (const sourceExt of sourceExts) {
-				const candidate = stem + sourceExt;
-				if (allFileIds.has(candidate) && !excludeIds?.has(candidate)) {
-					canonicalOf.set(id, candidate);
-					break;
-				}
-			}
-			break;
-		}
+		if (!compiledExtensions.has(path.extname(id).toLowerCase())) continue;
+		const canonical = canonicalSourceTwin(id, allFileIds, excludeIds);
+		if (canonical !== id) canonicalOf.set(id, canonical);
 	}
 	const compiledTwinCount = canonicalOf.size;
 
@@ -211,6 +200,73 @@ export function aggregateGraphToFiles(
 		}
 	}
 	const ignoredFileCount = droppedIgnoredIds.size;
+
+	// Build logical symbol identities before counting symbols or edges. A compiled
+	// twin can carry the same declaration and edge evidence as its source; those
+	// are one logical observation after canonicalization. Match source declarations
+	// in stable insertion order so overloads with the same name/kind stay distinct.
+	const logicalSymbolByNode = new Map<string, string>();
+	const sourceSymbolsByFile = new Map<string, Map<string, string[]>>();
+	// A symbol kind is not stable across extractor surfaces: a declaration can
+	// be a `function` in a JS/TS fact and a `variable` in a compiled twin's
+	// syntax extraction. Keep a name-only index for the safe case where there is
+	// exactly one source declaration with that name; this prevents equivalent
+	// twins from inflating the preferred source while preserving overloads and
+	// genuinely ambiguous same-name declarations.
+	const sourceSymbolsByName = new Map<string, Map<string, string[]>>();
+	for (const node of graph.nodes.values()) {
+		if (node.kind !== "symbol" || !node.filePath || !node.symbolName) continue;
+		const raw = normalizeMapKey(node.filePath);
+		const canonical = canonicalOf.get(raw) ?? raw;
+		if (raw !== canonical) continue;
+		const key = `${node.symbolName}\u0000${node.symbolKind ?? ""}`;
+		const byName = sourceSymbolsByFile.get(canonical) ?? new Map<string, string[]>();
+		const ids = byName.get(key) ?? [];
+		ids.push(node.id);
+		byName.set(key, ids);
+		sourceSymbolsByFile.set(canonical, byName);
+		const bySymbolName = sourceSymbolsByName.get(canonical) ?? new Map<string, string[]>();
+		const nameIds = bySymbolName.get(node.symbolName) ?? [];
+		nameIds.push(node.id);
+		bySymbolName.set(node.symbolName, nameIds);
+		sourceSymbolsByName.set(canonical, bySymbolName);
+		logicalSymbolByNode.set(node.id, node.id);
+	}
+	// Assign each twin's declarations by occurrence within THAT twin file, not
+	// through one process-wide "used" set. A source can have several compiled
+	// siblings (`x.ts`, `x.js`, `x.mjs`, ...); every sibling's first `run` must
+	// map to the source's first `run`, while overloads with the same name/kind
+	// remain distinct by occurrence.
+	const twinOccurrencesByFile = new Map<string, Map<string, number>>();
+	for (const node of graph.nodes.values()) {
+		if (node.kind !== "symbol" || !node.filePath || !node.symbolName) continue;
+		const raw = normalizeMapKey(node.filePath);
+		const canonical = canonicalOf.get(raw) ?? raw;
+		if (raw === canonical) continue;
+		const key = `${node.symbolName}\u0000${node.symbolKind ?? ""}`;
+		const exactSourceIds = sourceSymbolsByFile.get(canonical)?.get(key) ?? [];
+		const nameSourceIds = sourceSymbolsByName.get(canonical)?.get(node.symbolName) ?? [];
+		// Prefer the kind-qualified mapping. Fall back only when the source name
+		// is unique; never guess among overloads or same-name declarations.
+		const sourceIds = exactSourceIds.length > 0
+			? exactSourceIds
+			: nameSourceIds.length === 1
+				? nameSourceIds
+				: [];
+		const occurrenceKey = exactSourceIds.length > 0 ? key : node.symbolName;
+		const occurrences = twinOccurrencesByFile.get(raw) ?? new Map<string, number>();
+		const occurrence = occurrences.get(occurrenceKey) ?? 0;
+		occurrences.set(occurrenceKey, occurrence + 1);
+		twinOccurrencesByFile.set(raw, occurrences);
+		const logical = sourceIds[occurrence];
+		if (logical) {
+			logicalSymbolByNode.set(node.id, logical);
+		} else {
+			// A compiled-only declaration remains real evidence.
+			logicalSymbolByNode.set(node.id, node.id);
+		}
+	}
+	const countedLogicalSymbols = new Set<string>();
 
 	// ── Pass 3: aggregate nodes under their canonical file identity ─────────
 	for (const node of graph.nodes.values()) {
@@ -241,9 +297,13 @@ export function aggregateGraphToFiles(
 			if (droppedIgnoredIds.has(raw)) continue;
 			const id = canonicalOf.get(raw) ?? raw;
 			nodeToFile.set(node.id, id);
+			const logicalId = logicalSymbolByNode.get(node.id) ?? node.id;
 			const existing = files.get(id);
 			if (existing) {
-				existing.symbolCount += 1;
+				if (!countedLogicalSymbols.has(logicalId)) {
+					existing.symbolCount += 1;
+					countedLogicalSymbols.add(logicalId);
+				}
 			} else {
 				files.set(id, {
 					id,
@@ -251,6 +311,7 @@ export function aggregateGraphToFiles(
 					language: node.language || "",
 					symbolCount: 1,
 				});
+				countedLogicalSymbols.add(logicalId);
 			}
 			continue;
 		}
@@ -265,10 +326,16 @@ export function aggregateGraphToFiles(
 	// becomes self-referential only AFTER canonicalization (e.g. x.js → x.ts)
 	// collapses through the same fromFile === toFile check.
 	const edgeWeights = new Map<string, number>();
+	const seenLogicalEdges = new Set<string>();
 	for (const edge of graph.edges) {
 		const fromFile = nodeToFile.get(edge.from);
 		const toFile = nodeToFile.get(edge.to);
 		if (!fromFile || !toFile || fromFile === toFile) continue;
+		const logicalFrom = logicalSymbolByNode.get(edge.from) ?? fromFile;
+		const logicalTo = logicalSymbolByNode.get(edge.to) ?? toFile;
+		const logicalEdgeKey = `${logicalFrom}\u0000${logicalTo}\u0000${edge.kind}`;
+		if (seenLogicalEdges.has(logicalEdgeKey)) continue;
+		seenLogicalEdges.add(logicalEdgeKey);
 		// NUL separator (same idiom as review-graph/builder.ts): the one byte
 		// that can never appear in a file path, written as an escape sequence so
 		// this source file stays text for grep (a literal NUL makes ripgrep

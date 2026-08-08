@@ -5,6 +5,7 @@ import { Worker } from "node:worker_threads";
 import { constants as zlibConstants, gunzipSync, gzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { writeFileAtomic } from "../atomic-write.js";
+import type { CallGraphEvidenceCoverage } from "../call-graph.js";
 import type { FactStore } from "../dispatch/fact-store.js";
 import { fileContentProvider } from "../dispatch/facts/file-content.js";
 import type { FunctionSummary } from "../dispatch/facts/function-facts.js";
@@ -70,6 +71,7 @@ import type {
 	ReviewGraphNode,
 	ReviewGraphPersistCoverage,
 } from "./types.js";
+import type { SymbolKind, SymbolRef } from "../symbol-types.js";
 import type {
 	ReviewGraphPersistWorkerRequest,
 	ReviewGraphPersistWorkerResult,
@@ -77,6 +79,7 @@ import type {
 import {
 	clearReviewGraphFileIr,
 	getFreshReviewGraphFileIr,
+	type ReviewGraphExtractionStatus,
 	type ReviewGraphStructuralIr,
 	reviewGraphIrContentHash,
 } from "./shared-extraction-ir.js";
@@ -110,7 +113,10 @@ import {
 // safe-rebuild mechanism as the v2→v3/v3→v4/v4→v5 bumps above.
 // v7 (#939): the canonical snapshot is streamed gzip. A v7 payload in the
 // legacy uncompressed filename remains readable for one compatibility release.
-const REVIEW_GRAPH_VERSION = "v7";
+// v8 (#1070): call/reference evidence now records call-like vs type-only
+// references and tree-sitter query coverage, so call-graph consumers cannot
+// mistake incomplete extraction for a clean zero.
+export const REVIEW_GRAPH_VERSION = "v8";
 const MAIN_KINDS = new Set([
 	"jsts",
 	"python",
@@ -139,6 +145,8 @@ const MAIN_KINDS = new Set([
 const MAIN_KIND_EXTENSIONS: string[] = Array.from(MAIN_KINDS).flatMap(
 	(kind) => KIND_EXTENSIONS[kind as keyof typeof KIND_EXTENSIONS] ?? [],
 );
+/** The bounded, source-filtered extension set shared by graph cache readers. */
+export const REVIEW_GRAPH_SOURCE_EXTENSIONS: readonly string[] = MAIN_KIND_EXTENSIONS;
 const CHANGED_SYMBOLS_PREFIX = "session.reviewGraph.changedSymbols:";
 const extractorCache = new Map<string, TreeSitterSymbolExtractor | null>();
 
@@ -298,6 +306,37 @@ export function clearReviewGraphWorkspaceCache(cwd?: string): void {
 	_lastGraphBuildInfo = { reused: false, mode: "full", graphChanged: true };
 }
 
+export interface ReviewGraphWorkspaceCacheSnapshot {
+	/** Resident entries in `_workspaceGraphCache` — one per distinct cwd this
+	 *  process has built a graph for (#1123 item 2 memory attribution). */
+	cacheEntries: number;
+	/** Sum of `graph.nodes.size` across every resident entry. */
+	totalNodes: number;
+	/** Sum of `graph.edges.length` across every resident entry. */
+	totalEdges: number;
+}
+
+/**
+ * O(cache-entries) snapshot of the resident workspace graph cache — NOT
+ * O(nodes)/O(edges): only `.size`/`.length` are read per entry, never the
+ * graph contents themselves (#1123 item 2 memory-attribution sample). Cache
+ * entries are per-cwd and normally number 1 (a session_start clears the
+ * cache), so this is cheap enough for a per-N-turn sample.
+ */
+export function getReviewGraphWorkspaceCacheSnapshot(): ReviewGraphWorkspaceCacheSnapshot {
+	let totalNodes = 0;
+	let totalEdges = 0;
+	for (const entry of _workspaceGraphCache.values()) {
+		totalNodes += entry.graph.nodes.size;
+		totalEdges += entry.graph.edges.length;
+	}
+	return {
+		cacheEntries: _workspaceGraphCache.size,
+		totalNodes,
+		totalEdges,
+	};
+}
+
 export function _getReviewGraphCacheStateForTests(cwd: string):
 	| {
 			signature: string;
@@ -312,6 +351,53 @@ export function _getReviewGraphCacheStateForTests(cwd: string):
 		fileSignatures: new Map(cached.fileSignatures),
 		fileHashes: cached.fileHashes ? new Map(cached.fileHashes) : undefined,
 	};
+}
+
+/**
+ * Identity of the canonical review-graph cache used by derived projections.
+ * This is deliberately read-only: callers get the cache's source signature and
+ * graph schema version, never the source-file map or graph itself.
+ *
+ * The workspace entry is populated by both the in-memory build path and the
+ * persisted-snapshot hydration path, so consumers do not need a second source
+ * walk (or an independent mtime policy) to validate derived data.
+ */
+export interface ReviewGraphCacheIdentity {
+	version: string;
+	signature: string;
+}
+
+export function getReviewGraphCacheIdentity(
+	cwd: string,
+	graph?: ReviewGraph,
+): ReviewGraphCacheIdentity | undefined {
+	const cached = _workspaceGraphCache.get(normalizeMapKey(cwd));
+	if (!cached) return undefined;
+	// #1088: `version` is the constant schema tag ("v8" today) — identical for
+	// every live graph, so comparing it can never detect that `graph` is a
+	// stale instance the workspace cache has since replaced (e.g. a concurrent
+	// build racing between this caller's projection snapshot and its identity
+	// lookup). Compare the ENTRY's generation stamp (#459), not the stored
+	// graph object's: reuse paths store an unstamped `cloneGraph` copy and
+	// stamp only the returned instance, so `cached.graph.buildGeneration` is
+	// undefined on every drift-reuse / disk-hit entry while the caller's graph
+	// carries the entry's generation. The both-undefined case is legitimate
+	// only for the tier-3 hydration entry, where the caller holds the exact
+	// stored instance — anything else unstamped must not resolve an identity
+	// (e.g. the size-skip empty graph racing a hydrated entry).
+	if (graph) {
+		if (cached.buildGeneration === undefined && graph.buildGeneration === undefined) {
+			if (cached.graph !== graph) return undefined;
+		} else if (cached.buildGeneration !== graph.buildGeneration) {
+			return undefined;
+		}
+	}
+	const version = graph?.version ?? cached.graph.version;
+	if (typeof version !== "string" || version.length === 0 ||
+		typeof cached.signature !== "string") {
+		return undefined;
+	}
+	return { version, signature: cached.signature };
 }
 
 // #300 Edge 2: the review-graph's cross-worktree isolation is INCIDENTAL to
@@ -613,7 +699,7 @@ function diffSignatureMaps(
 // `RUNTIME_CONFIG.reviewGraph.maxFiles` constant as the fallback — the ratio
 // table reproduces that same 1,000-file default at the default base, so this
 // is behavior-neutral when nothing is configured.
-function getReviewGraphMaxFiles(cwd?: string): number {
+export function getReviewGraphMaxFiles(cwd?: string): number {
 	const override = Number.parseInt(
 		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES ?? "",
 		10,
@@ -843,7 +929,7 @@ export function _setReviewGraphEntryBudgetForTests(
 	_reviewGraphEntryBudgetForTests = maxScanEntries;
 }
 
-async function getGraphSourceFiles(
+export async function getGraphSourceFiles(
 	cwd: string,
 ): Promise<GraphSourceFilesResult> {
 	// Async, chunked-yield walk (identical output to the sync collector) so the
@@ -1005,7 +1091,15 @@ function loadPersistedGraph(
 			? gunzipSync(fs.readFileSync(cachePath)).toString("utf-8")
 			: fs.readFileSync(legacyPath, "utf-8");
 		const data = JSON.parse(raw) as PersistedGraphData;
-		if (data.version !== REVIEW_GRAPH_VERSION) return null;
+		// Derived projections require a canonical source identity. Legacy or
+		// malformed snapshots are unavailable, never a clean empty graph.
+		if (
+			data.version !== REVIEW_GRAPH_VERSION ||
+			typeof data.signature !== "string" ||
+			typeof data.builtAt !== "string" ||
+			!Array.isArray(data.nodes) ||
+			!Array.isArray(data.edges)
+		) return null;
 		if (data.coverage?.partial && !opts?.allowPartial) return null;
 		if (opts?.verifyGitStamp && data.gitStamp) {
 			// #300: a stamped snapshot must match the CURRENT repo identity. This
@@ -1672,7 +1766,6 @@ function getPersistWorker(): Worker | undefined {
 			return undefined;
 		}
 		const worker = new Worker(workerPath);
-		worker.unref();
 		worker.on("message", handleWorkerResult);
 		worker.on("error", (err: Error) => handleWorkerDeath(err.message));
 		worker.on("exit", (code) => {
@@ -1692,6 +1785,9 @@ function getPersistWorker(): Worker | undefined {
 				_persistWorker = undefined;
 			}
 		});
+		// #1148: adding a message listener refs the Worker's public MessagePort.
+		// Unref only after every listener is installed so it stays background-only.
+		worker.unref();
 		_persistWorker = worker;
 		return worker;
 	} catch (err) {
@@ -2036,7 +2132,7 @@ function reviewGraphCheckpointPath(cwd: string): string {
  * only reuses a checkpoint built under the same ignore state. */
 function hashIgnoredIds(ignoredIds: ReadonlySet<string> | undefined): string {
 	if (ignoredIds === undefined) return "unavailable";
-	const joined = [...ignoredIds].sort((a, b) => a.localeCompare(b)).join(" ");
+	const joined = [...ignoredIds].sort((a, b) => a.localeCompare(b)).join("\u0000");
 	return createHash("sha256").update(joined).digest("hex");
 }
 
@@ -2677,7 +2773,13 @@ function localImportToFile(
 	}
 	const root = path.resolve(cwd);
 	for (const candidate of jsTsCandidatePaths(filePath, source)) {
-		if (!candidate.startsWith(root) || !fs.existsSync(candidate)) continue;
+		const relative = path.relative(root, candidate);
+		if (
+			(relative.startsWith("..") &&
+				(relative.length === 2 || relative.startsWith(`..${path.sep}`))) ||
+			path.isAbsolute(relative) ||
+			!fs.existsSync(candidate)
+		) continue;
 		const normalized = normalizeMapKey(candidate);
 		if (ignoredIds?.has(normalized)) continue;
 		return normalized;
@@ -2752,6 +2854,16 @@ function addJsTsFile(
 	const hintPath = toProjectRelativePath(normalized, cwd);
 	const content = facts.getFileFact<string>(normalized, "file.content") ?? "";
 	const fileNodeId = `file:${normalized}`;
+	// The function-facts provider uses the shared tree-sitter integration for
+	// both TypeScript and JavaScript-family grammars. Do not suppress JS call
+	// evidence merely because import resolution may canonicalize a compiled twin
+	// onto its source; the graph must describe every supported source file, and
+	// lens-map performs the separate presentation-level twin merge.
+	const warmCallCoverage =
+		facts.getFileFact<string>(normalized, "file.functionFactsCoverage") ??
+		"unavailable";
+	const importCoverage =
+		facts.getFileFact<string>(normalized, "file.importFactsCoverage") ?? "unavailable";
 	addNode(graph, {
 		id: fileNodeId,
 		kind: "file",
@@ -2759,6 +2871,12 @@ function addJsTsFile(
 		filePath: normalized,
 		metadata: {
 			lineCount: content.split("\n").length,
+			extractionCoverage: {
+				definitions: warmCallCoverage,
+				references: warmCallCoverage,
+				imports: importCoverage,
+				calls: warmCallCoverage,
+			},
 			...featureHintMetadata(hintPath),
 		},
 	});
@@ -2852,6 +2970,7 @@ function addJsTsFile(
 			).test(content),
 			metadata: {
 				line: fn.line,
+				endLine: fn.endLine,
 				column: fn.column,
 				cyclomaticComplexity: fn.cyclomaticComplexity,
 				maxNestingDepth: fn.maxNestingDepth,
@@ -3052,7 +3171,16 @@ async function extractTreeSitterSymbols(
 	languageId: string,
 	contentOverride?: string | null,
 ): Promise<ExtractedSymbols> {
-	const empty: ExtractedSymbols = { symbols: [], refs: [], imports: [] };
+	const empty: ExtractedSymbols = {
+		symbols: [],
+		refs: [],
+		imports: [],
+		coverage: {
+			definitions: "unavailable",
+			references: "unavailable",
+			imports: "unavailable",
+		},
+	};
 	if (contentOverride === null) return empty;
 	const treeSitterClient = getSharedTreeSitterClient();
 	if (!treeSitterClient) return empty;
@@ -3095,6 +3223,21 @@ export async function captureReviewGraphStructuralIr(
 		}
 		const parsed = await withTreeSitterRoot(filePath, content, () => true);
 		if (!parsed.parsed) return { complete: false };
+		const functionCoverage: ReviewGraphExtractionStatus =
+			(facts.getFileFact<string>(filePath, "file.functionFactsCoverage") as ReviewGraphExtractionStatus | undefined) ??
+			"unavailable";
+		const importCoverage: ReviewGraphExtractionStatus =
+			(facts.getFileFact<string>(filePath, "file.importFactsCoverage") as ReviewGraphExtractionStatus | undefined) ??
+			"unavailable";
+		const coverage = {
+			definitions: functionCoverage,
+			references: functionCoverage,
+			imports: importCoverage,
+			calls: functionCoverage,
+		} as const;
+		if (Object.values(coverage).some((status) => status !== "complete")) {
+			return { complete: false };
+		}
 		return {
 			complete: true,
 			structural: {
@@ -3108,11 +3251,14 @@ export async function captureReviewGraphStructuralIr(
 						filePath,
 						"file.functionSummaries",
 					) ?? [],
+				coverage,
 			},
 		};
 	}
 	const languageId = mapKindToTreeSitterLanguage(kind, filePath);
-	if (!languageId) return { complete: true };
+	// A graph-relevant kind without a tree-sitter mapping is unsupported, not
+	// an empty successful extraction. Do not publish a complete IR for it.
+	if (!languageId) return { complete: false };
 	const client = getSharedTreeSitterClient();
 	if (!client || !(await client.init())) return { complete: false };
 	const extractor = await getExtractor(languageId);
@@ -3187,7 +3333,10 @@ function addTreeSitterFile(
 		kind: "file",
 		language: languageId,
 		filePath: normalized,
-		metadata: featureHintMetadata(hintPath),
+		metadata: {
+			...featureHintMetadata(hintPath),
+			extractionCoverage: extracted.coverage,
+		},
 	});
 
 	const dedupedSymbols = dedupeSamePositionSymbols(extracted.symbols);
@@ -3227,6 +3376,7 @@ function addTreeSitterFile(
 			exported: symbol.isExported,
 			metadata: {
 				line: symbol.line,
+				endLine: symbol.endLine,
 				column: symbol.column,
 				signature: symbol.signature,
 				...featureHintMetadata(`${symbol.name} ${hintPath}`),
@@ -3237,21 +3387,26 @@ function addTreeSitterFile(
 	}
 
 	for (const ref of extracted.refs) {
-		const targetId = `symbol-name:${ref.symbolId.split(":").pop() ?? ref.symbolId}`;
+		const refName = ref.symbolName ?? ref.symbolId;
+		const targetId = `symbol-name:${refName}`;
 		if (!graph.nodes.has(targetId)) {
 			addNode(graph, {
 				id: targetId,
 				kind: "symbol",
 				language: languageId,
-				symbolName: ref.symbolId.split(":").pop() ?? ref.symbolId,
-				metadata: { unresolvedName: ref.symbolId },
+				symbolName: refName,
+				metadata: { unresolvedName: refName },
 			});
 		}
 		addEdge(graph, {
 			from: fileNodeId,
 			to: targetId,
 			kind: "references",
-			metadata: { line: ref.line, column: ref.column },
+			metadata: {
+				line: ref.line,
+				column: ref.column,
+				referenceKind: ref.referenceKind ?? "unknown",
+			},
 			// Always starts bare-name-only (the extractor has no scope/type info);
 			// resolveDeferredSymbolEdges may upgrade this to "exact" below.
 			resolution: "name-only",
@@ -3567,6 +3722,8 @@ async function addFileToGraph(
 					"file.functionSummaries",
 					sharedIr.functionSummaries,
 				);
+				facts.setFileFact(file, "file.functionFactsCoverage", sharedIr.coverage.calls);
+				facts.setFileFact(file, "file.importFactsCoverage", sharedIr.coverage.imports);
 			} else {
 				await ensureReviewGraphFacts(file, cwd, facts, contentOverride);
 			}
@@ -4683,52 +4840,176 @@ export function buildOrUpdateGraph(
 }
 
 /**
- * Extract symbols and refs from an already-built ReviewGraph for call graph construction.
- * Reuses parsed data without re-running tree-sitter — symbols come from "symbol" nodes,
- * refs come from "references" edges. Line numbers are unavailable here (not stored in graph
- * nodes), so caller attribution falls back to file-level keys in buildCallGraph.
+ * Normalize graph symbol/call/reference evidence for call-graph construction.
+ *
+ * Graph node ids are opaque canonical identities (kind and line are part of the
+ * id), so this adapter always reads target metadata from the target node. It
+ * retains unresolved/type-only evidence for bounded coverage accounting, but
+ * buildCallGraph will not turn those records into concrete edges.
  */
 export function extractSymbolsAndRefsFromGraph(graph: ReviewGraph): {
 	allSymbols: Map<string, import("../symbol-types.js").Symbol[]>;
 	allRefs: Map<string, import("../symbol-types.js").SymbolRef[]>;
+	coverage: CallGraphEvidenceCoverage;
 } {
 	const allSymbols = new Map<string, import("../symbol-types.js").Symbol[]>();
 	const allRefs = new Map<string, import("../symbol-types.js").SymbolRef[]>();
+	const nodeSymbols = new Map<string, import("../symbol-types.js").Symbol>();
+	const coverage: CallGraphEvidenceCoverage = {
+		totalEvidence: 0,
+		callsEvidence: 0,
+		referencesEvidence: 0,
+		eligibleEvidence: 0,
+		resolvedEvidence: 0,
+		unresolvedEvidence: 0,
+		typeOnlyEvidence: 0,
+		unsupportedEvidence: 0,
+		sameFileEvidence: 0,
+		duplicateEvidence: 0,
+		complete: graph.persistCoverage?.partial !== true && graph.persistCoverage?.inProgress !== true,
+		languages: {},
+	};
+
+	const numberMetadata = (node: ReviewGraphNode | undefined, key: string): number | undefined => {
+		const value = node?.metadata?.[key];
+		return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+	};
+	const symbolKind = (node: ReviewGraphNode): SymbolKind => {
+		switch (node.symbolKind) {
+			case "class":
+			case "interface":
+			case "type":
+			case "variable":
+			case "method":
+			case "property":
+			case "function":
+				return node.symbolKind;
+			default:
+				return "function";
+		}
+	};
 
 	for (const node of graph.nodes.values()) {
-		if (node.kind === "symbol" && node.filePath && node.symbolName) {
-			const sym: import("../symbol-types.js").Symbol = {
-				id: `${node.filePath}:${node.symbolName}`,
-				name: node.symbolName,
-				kind: "function" as const,
-				filePath: node.filePath,
-				line: 1,
-				column: 1,
-				isExported: false,
-			};
-			const list = allSymbols.get(node.filePath) ?? [];
-			list.push(sym);
-			allSymbols.set(node.filePath, list);
-		}
+		if (node.kind !== "symbol" || !node.filePath || !node.symbolName) continue;
+		const sym: import("../symbol-types.js").Symbol = {
+			id: node.id,
+			name: node.symbolName,
+			kind: symbolKind(node),
+			filePath: node.filePath,
+			line: numberMetadata(node, "line") ?? 1,
+			endLine: numberMetadata(node, "endLine"),
+			column: numberMetadata(node, "column") ?? 1,
+			isExported: node.exported === true,
+		};
+		nodeSymbols.set(node.id, sym);
+		const list = allSymbols.get(node.filePath) ?? [];
+		list.push(sym);
+		allSymbols.set(node.filePath, list);
 	}
+
+	const addRef = (ref: SymbolRef): void => {
+		const list = allRefs.get(ref.filePath) ?? [];
+		list.push(ref);
+		allRefs.set(ref.filePath, list);
+	};
 
 	for (const edge of graph.edges) {
-		if (edge.kind === "references" && edge.from.startsWith("file:")) {
-			const callerFile = edge.from.slice("file:".length);
-			const refName = edge.to.startsWith("symbol-name:")
+		if (edge.kind !== "calls" && edge.kind !== "references") continue;
+		coverage.totalEvidence++;
+		if (edge.kind === "calls") coverage.callsEvidence++;
+		else coverage.referencesEvidence++;
+
+		const fromNode = graph.nodes.get(edge.from);
+		const targetNode = graph.nodes.get(edge.to);
+		const callerFile = fromNode?.kind === "symbol"
+			? fromNode.filePath
+			: fromNode?.kind === "file"
+				? fromNode.filePath
+				: edge.from.startsWith("file:")
+					? edge.from.slice("file:".length)
+					: undefined;
+		if (!callerFile) {
+			coverage.unsupportedEvidence++;
+			continue;
+		}
+		const metadata = edge.metadata ?? {};
+		const referenceKind = edge.kind === "calls"
+			? "call"
+			: metadata.referenceKind === "call"
+				? "call"
+				: metadata.referenceKind === "type"
+					? "type"
+					: "unknown";
+		const resolution = edge.resolution ?? (targetNode && !targetNode.metadata?.unresolvedName ? "exact" : "unresolved");
+		const targetSymbol = nodeSymbols.get(edge.to);
+		const targetName = targetNode?.symbolName ??
+			(edge.to.startsWith("symbol-name:")
 				? edge.to.slice("symbol-name:".length)
-				: (edge.to.split(":").pop() ?? edge.to);
-			const ref: import("../symbol-types.js").SymbolRef = {
-				symbolId: `${callerFile}:${refName}`,
-				filePath: callerFile,
-				line: (edge.metadata as { line?: number } | undefined)?.line ?? 1,
-				column: (edge.metadata as { column?: number } | undefined)?.column ?? 1,
-			};
-			const list = allRefs.get(callerFile) ?? [];
-			list.push(ref);
-			allRefs.set(callerFile, list);
+				: undefined);
+		const line = typeof metadata.line === "number" ? metadata.line : numberMetadata(fromNode, "line") ?? 1;
+		const column = typeof metadata.column === "number" ? metadata.column : numberMetadata(fromNode, "column") ?? 1;
+		addRef({
+			symbolId: targetName ? `${callerFile}:${targetName}` : edge.to,
+			filePath: callerFile,
+			line,
+			column,
+			evidenceKind: edge.kind,
+			referenceKind,
+			targetId: edge.to,
+			callerSymbolId: fromNode?.kind === "symbol" ? fromNode.id : undefined,
+			resolution,
+			targetName,
+			targetKind: targetNode?.symbolKind,
+			targetFilePath: targetNode?.filePath,
+			targetLine: numberMetadata(targetNode, "line"),
+			targetColumn: numberMetadata(targetNode, "column"),
+		});
+
+		if (referenceKind === "type") coverage.typeOnlyEvidence++;
+		else if (referenceKind !== "call") coverage.unsupportedEvidence++;
+		else if (!targetSymbol || resolution === "name-only" || resolution === "unresolved") {
+			coverage.unresolvedEvidence++;
+		} else {
+			coverage.eligibleEvidence++;
+			coverage.resolvedEvidence++;
 		}
 	}
 
-	return { allSymbols, allRefs };
+	// Capped/partial graph persistence and file-level extractor metadata are
+	// explicit degradation signals for read-only consumers. Missing metadata is
+	// also unavailable: old/synthetic file nodes cannot prove that definitions,
+	// references, or the TS/TSX warm function facts were attempted successfully.
+	let sawRelevantFileNode = false;
+		for (const node of graph.nodes.values()) {
+			if (node.kind !== "file") continue;
+			sawRelevantFileNode = true;
+			const extraction = node.metadata?.extractionCoverage as
+				| Record<string, "complete" | "partial" | "unavailable" | undefined>
+				| undefined;
+			const statuses = extraction ? Object.values(extraction) : [];
+			const languageStatus = !extraction || statuses.length === 0 || statuses.includes("unavailable")
+				? "unavailable"
+				: statuses.includes("partial")
+					? "partial"
+					: "complete";
+			if (languageStatus !== "complete") coverage.complete = false;
+			if (node.language) {
+				const prior = coverage.languages![node.language];
+				coverage.languages![node.language] =
+					prior === "unavailable" || languageStatus === "unavailable"
+						? "unavailable"
+						: prior === "partial" || languageStatus === "partial"
+							? "partial"
+							: languageStatus;
+			}
+		}
+		// A graph with symbols/evidence but no file coverage metadata is a
+		// synthetic/legacy shape that cannot prove which source files were
+		// actually extracted. Do not let it masquerade as a complete scan.
+		// No file node means there is no bounded source/extractor coverage to
+		// justify a clean empty call graph (including an entirely empty or
+		// external-only synthetic graph).
+		if (!sawRelevantFileNode) coverage.complete = false;
+
+		return { allSymbols, allRefs, coverage };
 }

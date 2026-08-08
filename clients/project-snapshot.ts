@@ -684,7 +684,6 @@ function getSnapshotPersistWorker(): Worker | undefined {
 			return undefined;
 		}
 		const worker = new Worker(workerPath);
-		worker.unref();
 		worker.on("message", handleSnapshotWorkerResult);
 		worker.on("error", (err: Error) => handleSnapshotWorkerDeath(err.message));
 		worker.on("exit", (code) => {
@@ -708,6 +707,9 @@ function getSnapshotPersistWorker(): Worker | undefined {
 			// stranded) just drops the reference so the next persist respawns.
 			if (code !== 0) _snapshotWorkerDisabled = true;
 		});
+		// #1148: adding a message listener refs the Worker's public MessagePort.
+		// Unref only after every listener is installed so it stays background-only.
+		worker.unref();
 		_snapshotPersistWorker = worker;
 		return worker;
 	} catch (err) {

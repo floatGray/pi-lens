@@ -81,6 +81,7 @@ export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
 	ocaml: { lspCapable: true },
 	clojure: { lspCapable: true },
 	terraform: { lspCapable: true },
+	terragrunt: { lspCapable: false },
 	nix: { lspCapable: true },
 	toml: { lspCapable: true, startup: { defaults: ["taplo"] } },
 };
@@ -214,8 +215,13 @@ const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
 	clojure: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["clojure"] },
 	terraform: {
 		mode: "all",
-		runnerIds: ["lsp", "tflint"],
+		runnerIds: ["lsp", "tflint", "trivy-config"],
 		filterKinds: ["terraform"],
+	},
+	terragrunt: {
+		mode: "all",
+		runnerIds: ["terragrunt"],
+		filterKinds: ["terragrunt"],
 	},
 	nix: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["nix"] },
 	toml: {

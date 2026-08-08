@@ -227,6 +227,79 @@ describe("index.ts integration", () => {
 		});
 	}, INTEGRATION_TIMEOUT_MS);
 
+	it("session_shutdown dumps active handles AFTER LSP teardown (#1123 item 4)", async () => {
+		// #1097 lesson: "what survives IS the leak" — the dump must run after
+		// resetLSPService, not before, or it would report handles teardown was
+		// about to close as still-alive noise.
+		const order: string[] = [];
+		const resetLSPService = vi.fn(() => {
+			order.push("reset_lsp_service");
+		});
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: () => ({
+				touchFile: vi.fn(),
+				getAliveClientCount: () => 0,
+				getAliveServerIds: () => [],
+			}),
+			resetLSPService,
+		}));
+		vi.doMock("../clients/debug-handles.js", () => ({
+			dumpActiveHandles: (label: string) => {
+				order.push(`dump:${label}`);
+			},
+		}));
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const shutdown = handlers.session_shutdown?.[0];
+		expect(shutdown).toBeTypeOf("function");
+		shutdown?.({ reason: "quit" }, { cwd: tmpDir });
+
+		expect(order).toEqual(["reset_lsp_service", "dump:session_shutdown"]);
+	}, INTEGRATION_TIMEOUT_MS);
+
+	it("agent_settled dumps active handles AFTER quiet-window work is scheduled (#1123 item 4)", async () => {
+		// #1097's leak (a stray ref'd timer) only surfaces once whatever
+		// agent_settled itself queues is already in flight, so the dump must
+		// fire after runQuietWindow is invoked, not before.
+		const order: string[] = [];
+		vi.doMock("../clients/lsp/index.js", () => ({
+			getLSPService: () => ({
+				touchFile: vi.fn(),
+				getAliveClientCount: () => 0,
+				getAliveServerIds: () => [],
+			}),
+			resetLSPService: vi.fn(),
+		}));
+		vi.doMock("../clients/quiet-window.js", () => ({
+			registerQuietWindowTask: () => {},
+			registerBuiltinQuietWindowTasks: () => {},
+			runQuietWindow: async () => {
+				order.push("quiet_window_scheduled");
+			},
+		}));
+		vi.doMock("../clients/debug-handles.js", () => ({
+			dumpActiveHandles: (label: string) => {
+				order.push(`dump:${label}`);
+			},
+		}));
+
+		const { default: registerExtension } = await import("../index.ts");
+		const { pi, handlers } = createMockPi();
+		registerExtension(pi as any);
+
+		const settled = handlers.agent_settled?.[0];
+		expect(settled).toBeTypeOf("function");
+		await settled?.({}, { cwd: tmpDir });
+		// runQuietWindow is kicked off unawaited (fire-and-forget by design);
+		// drain the microtask queue before asserting.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(order).toEqual(["quiet_window_scheduled", "dump:agent_settled"]);
+	}, INTEGRATION_TIMEOUT_MS);
+
 	it("idle LSP reset repaints the footer to Inactive (detached 240s timer)", async () => {
 		// The idle reset releases the warm servers from a detached timer with no pi
 		// event in flight; without the wrapped reset the footer would keep showing a

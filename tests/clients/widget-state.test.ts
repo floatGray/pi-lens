@@ -12,6 +12,7 @@ import {
 	getSessionLanguages,
 	importWidgetState,
 	reconcileScanDiagnostics,
+	reconcileStaleWidgetFiles,
 	recordDiagnostics,
 	recordFormatter,
 	recordLsp,
@@ -21,6 +22,7 @@ import {
 	renderWidget,
 	setRenderCallback,
 	setSessionLanguages,
+	WIDGET_STATE_VERSION,
 } from "../../clients/widget-state.ts";
 
 const e = String.fromCharCode(27);
@@ -766,6 +768,65 @@ describe("reconcileScanDiagnostics — full-scan/on-demand footer reconciliation
 	});
 });
 
+describe("reconcileScanDiagnostics observation timestamp — cache-hit replays must not re-arm staleness (#1093/#1092)", () => {
+	it("stamps touchedAt at the OBSERVED time, so the entry drops once the file's mtime passes that observation", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "obs-stamp-"));
+		const filePath = path.join(tmpDir, `cached-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const x = 1;\n");
+
+			// A workspace-diagnostics cache HIT replays a finding OBSERVED 20s ago
+			// (the cache entry's own `scannedAt`). The reconcile must stamp
+			// `touchedAt` with THAT observation time, not now().
+			const observedAt = Date.now() - 20_000;
+			reconcileScanDiagnostics(
+				filePath,
+				[{ severity: "error", message: "cached finding", rule: "X" }],
+				true,
+				1,
+				observedAt,
+			);
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+
+			// The file itself was edited 10s ago — AFTER the cached observation — so
+			// the replayed finding is stale. mtime(now-10s) > touchedAt(now-20s), so
+			// the mtime-staleness gate must drop it. Pre-fix (`touchedAt = now()`
+			// on every reconcile) the entry survives forever: the #1092 defect.
+			const mtime = new Date(Date.now() - 10_000);
+			await fs.utimes(filePath, mtime, mtime);
+
+			expect(await reconcileStaleWidgetFiles()).toBe(1);
+			expect(getFileDiagnostics(filePath)).toBeUndefined();
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+
+	it("a fresh reconcile (no observation stamp) is observed now and survives an older mtime (control)", async () => {
+		const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "obs-stamp-fresh-"));
+		const filePath = path.join(tmpDir, `fresh-${Date.now()}.ts`);
+		try {
+			await fs.writeFile(filePath, "const y = 2;\n");
+			// No observedAt: a genuinely fresh touch, observed now.
+			reconcileScanDiagnostics(
+				filePath,
+				[{ severity: "error", message: "fresh finding", rule: "X" }],
+				true,
+				1,
+			);
+			// The file's mtime is in the PAST relative to this fresh observation, so
+			// the finding is current and must NOT be dropped.
+			const past = new Date(Date.now() - 10_000);
+			await fs.utimes(filePath, past, past);
+
+			expect(await reconcileStaleWidgetFiles()).toBe(0);
+			expect(getFileDiagnostics(filePath)).toHaveLength(1);
+		} finally {
+			await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+		}
+	});
+});
+
 describe("path-key normalization — same file under mixed separators collapses to one entry (#1020)", () => {
 	// The two forms differ ONLY in separator direction, so they fold to the same
 	// key on every platform (`normalizeEphemeralMapKey` converts `\`→`/` always,
@@ -801,7 +862,7 @@ describe("path-key normalization — same file under mixed separators collapses 
 
 	it("importWidgetState folds a persisted forward-slash key so a later backslash reconcile hits the same entry", () => {
 		importWidgetState({
-			version: 1,
+			version: WIDGET_STATE_VERSION,
 			sessionLanguages: [],
 			files: [
 				{

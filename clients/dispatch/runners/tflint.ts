@@ -1,7 +1,10 @@
 import * as path from "node:path";
 import { ensureTool } from "../../installer/index.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
+import { getLinterPolicyForCwd } from "../../tool-policy.js";
+import { findNearestDirWithAnyBasename } from "../../workspace-topology.js";
 import { createAvailabilityChecker } from "./utils/runner-helpers.js";
+import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -11,6 +14,22 @@ import type {
 import { PRIORITY } from "../priorities.js";
 
 const tflint = createAvailabilityChecker("tflint", ".exe");
+
+const TFLINT_CONFIG = ".tflint.hcl";
+
+/**
+ * tflint resolves `.tflint.hcl` from its own working directory and never walks
+ * parents (its only fallback is `~/.tflint.hcl`). We run it from the edited
+ * file's directory, so a repo-root config would govern nothing beneath the
+ * root unless we name it explicitly. Returns null when `TFLINT_CONFIG_FILE` is
+ * set: `--config` outranks the env var in tflint's own precedence, so passing
+ * one would override a deliberate choice.
+ */
+function findTflintConfig(fileDir: string): string | null {
+	if (process.env.TFLINT_CONFIG_FILE) return null;
+	const dir = findNearestDirWithAnyBasename(fileDir, [TFLINT_CONFIG]);
+	return dir ? path.join(dir, TFLINT_CONFIG) : null;
+}
 
 interface TflintIssue {
 	rule: { name: string; severity: string };
@@ -60,6 +79,10 @@ const tflintRunner: RunnerDefinition = {
 
 	async run(ctx: DispatchContext): Promise<RunnerResult> {
 		const cwd = ctx.cwd || process.cwd();
+		const policy = getLinterPolicyForCwd(ctx.filePath, cwd);
+		if (policy && !policy.preferredRunners.includes("tflint")) {
+			return { status: "skipped", diagnostics: [], semantic: "none" };
+		}
 
 		let cmd: string | null = null;
 		if (await (tflint.isAvailableAsync(cwd))) {
@@ -73,13 +96,20 @@ const tflintRunner: RunnerDefinition = {
 
 		const absPath = path.resolve(cwd, ctx.filePath);
 		const fileDir = path.dirname(absPath);
-		const result = await safeSpawnAsync(
-			cmd,
-			["--format=json", "--no-color", `--filter=${path.basename(absPath)}`],
-			{ cwd: fileDir, timeout: 30000 },
-		);
+		const args = [
+			"--format=json",
+			"--no-color",
+			`--filter=${path.basename(absPath)}`,
+		];
+		const configPath = findTflintConfig(fileDir);
+		if (configPath) args.push(`--config=${configPath}`);
 
-		if (result.error && !result.stdout) {
+		const result = await safeSpawnAsync(cmd, args, {
+			cwd: fileDir,
+			timeout: 30000,
+		});
+
+		if (spawnFailedWithNoOutput(result)) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

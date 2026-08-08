@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createReadGuard,
 	currentLinesMatchReadSnapshot,
+	READ_GUARD_STATE_VERSION,
 	type ReadRecord,
 } from "../../clients/read-guard.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
@@ -1144,7 +1145,7 @@ describe("ReadGuard export/import across resume (#1041)", () => {
 
 			// `reads` is not an array (corrupt / hand-edited sidecar).
 			const nonArrayReads = {
-				version: 1,
+				version: READ_GUARD_STATE_VERSION,
 				reads: {} as unknown,
 			} as unknown as import("../../clients/read-guard.js").PersistedReadGuardState;
 			expect(() => guard.importState(nonArrayReads)).not.toThrow();
@@ -1155,7 +1156,7 @@ describe("ReadGuard export/import across resume (#1041)", () => {
 
 			// `reads` array with a non-tuple element mixed in with a valid one.
 			const badElement = {
-				version: 1,
+				version: READ_GUARD_STATE_VERSION,
 				reads: [[normalizeFilePath("/src/x.ts"), []], 5],
 			} as unknown as import("../../clients/read-guard.js").PersistedReadGuardState;
 			expect(() => guard.importState(badElement)).not.toThrow();

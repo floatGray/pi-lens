@@ -91,6 +91,16 @@ export interface DepCheckResult {
 interface FileImports {
 	imports: Set<string>;
 	timestamp: number;
+	/**
+	 * File byte size at cache time (#1105). The mtime fast-path below is a stale
+	 * signal on its own: a content change that PRESERVES mtime (git checkout
+	 * timestamp restoration, a formatter preserving mtime, a same-second write)
+	 * would let `importsChanged` return false and skip the madge circular-dep
+	 * re-check against edited imports. Size is free (the stat already ran) and is
+	 * the review-graph gold-standard second axis — an import edit almost always
+	 * changes byte length, so this closes the common case at zero I/O cost.
+	 */
+	size: number;
 }
 
 /**
@@ -275,8 +285,9 @@ export class DependencyChecker {
 		const stat = fs.statSync(normalized);
 		const cached = this.importCache.get(normalized);
 
-		// Fast path: timestamp hasn't changed
-		if (cached && cached.timestamp >= stat.mtimeMs) {
+		// Fast path: neither mtime NOR size moved (#1105 — size guards the
+		// mtime-preserving content change that mtime alone would miss).
+		if (cached && cached.timestamp >= stat.mtimeMs && cached.size === stat.size) {
 			return false;
 		}
 
@@ -288,6 +299,7 @@ export class DependencyChecker {
 		this.importCache.set(normalized, {
 			imports: newImports,
 			timestamp: stat.mtimeMs,
+			size: stat.size,
 		});
 		return hasChanged;
 	}

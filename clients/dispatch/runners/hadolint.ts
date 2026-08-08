@@ -12,6 +12,7 @@ import {
 	createAvailabilityChecker,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
+import { spawnFailedWithNoOutput } from "./utils/spawn-outcome.js";
 
 const hadolint = createAvailabilityChecker("hadolint", ".exe");
 
@@ -80,7 +81,7 @@ const hadolintRunner: RunnerDefinition = {
 			{ cwd },
 		);
 
-		if (result.error && !result.stdout) {
+		if (spawnFailedWithNoOutput(result)) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };
 		}
 

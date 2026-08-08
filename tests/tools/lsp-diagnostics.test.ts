@@ -1061,6 +1061,84 @@ describe("lsp_diagnostics tool", () => {
 			}
 		});
 
+		// #1095: a non-empty result whose content binding MISMATCHES disk must not
+		// re-cement the footer (the #1092 window-1 transcript: 17 live-looking
+		// diagnostics stamped fresh while tsc exits 0). This is THE headline
+		// regression: the "non-empty = definitionally confirmed" doctrine is now
+		// gated on binding.
+		function staleTouchResult(messages: string[], bound: boolean | "unknown") {
+			const result: any[] = messages.map((message) => ({
+				severity: 1,
+				message,
+				range: {
+					start: { line: 0, character: 0 },
+					end: { line: 0, character: 1 },
+				},
+				source: "ts",
+			}));
+			Object.defineProperty(result, "binding", {
+				value: { boundToCurrentDisk: bound },
+				enumerable: false,
+			});
+			return result;
+		}
+
+		it("does NOT reconcile a NON-EMPTY result whose binding mismatches disk (T2 headline #1092)", async () => {
+			const touchFile = vi
+				.fn()
+				.mockResolvedValue(staleTouchResult(["stale error from a pre-fix view"], false));
+			(mocked.service as any).touchFile = touchFile;
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-binding-mismatch-"),
+			);
+			const file = path.join(tmpDir, "bad.ts");
+			fs.writeFileSync(file, "const value = 1;\n");
+
+			const tool = createLspDiagnosticsTool(() => 1);
+			try {
+				await tool.execute(
+					"diag-binding-mismatch",
+					{ path: file, severity: "all", waitMs: 500 },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				);
+				// Demoted to unconfirmed → the stale view never confirms/writes.
+				expect(reconcileScanDiagnosticsMock).not.toHaveBeenCalled();
+			} finally {
+				removeTempDirSync(tmpDir);
+			}
+		});
+
+		it("DOES reconcile a non-empty result when the binding is unknown — version-less fallback unchanged (T3)", async () => {
+			const touchFile = vi
+				.fn()
+				.mockResolvedValue(staleTouchResult(["real error"], "unknown"));
+			(mocked.service as any).touchFile = touchFile;
+			const tmpDir = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-lsp-diag-binding-unknown-"),
+			);
+			const file = path.join(tmpDir, "bad.ts");
+			fs.writeFileSync(file, "const value = 1;\n");
+
+			const tool = createLspDiagnosticsTool(() => 1);
+			try {
+				await tool.execute(
+					"diag-binding-unknown",
+					{ path: file, severity: "all", waitMs: 500 },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				);
+				// Unknown binding preserves the pre-#1095 doctrine: a non-empty result
+				// is confirmed and reconciled.
+				expect(reconcileScanDiagnosticsMock).toHaveBeenCalledTimes(1);
+				expect(reconcileScanDiagnosticsMock.mock.calls[0][2]).toBe(true);
+			} finally {
+				removeTempDirSync(tmpDir);
+			}
+		});
+
 		it("reconciles a confirmed CLEAN (empty, non-tier3-silent) result — corrects a stale footer to empty", async () => {
 			mocked.cascadeTier = "waits";
 			const tmpDir = fs.mkdtempSync(

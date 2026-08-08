@@ -119,6 +119,105 @@ describe("aggregateGraphToFiles", () => {
 		expect(result.ignoredFileCount).toBe(0);
 	});
 
+	it("deduplicates identical source/twin symbols and remapped edge evidence", () => {
+		const nodes: ReviewGraphNode[] = [
+			{ id: "a.ts#file", kind: "file", language: "ts", filePath: "a.ts" },
+			{ id: "a.js#file", kind: "file", language: "js", filePath: "a.js" },
+			{ id: "b.ts#file", kind: "file", language: "ts", filePath: "b.ts" },
+			{ id: "b.js#file", kind: "file", language: "js", filePath: "b.js" },
+			{ id: "a.ts#run", kind: "symbol", language: "ts", filePath: "a.ts", symbolName: "run", symbolKind: "function" },
+			{ id: "a.js#run", kind: "symbol", language: "js", filePath: "a.js", symbolName: "run", symbolKind: "function" },
+			{ id: "b.ts#target", kind: "symbol", language: "ts", filePath: "b.ts", symbolName: "target", symbolKind: "function" },
+			{ id: "b.js#target", kind: "symbol", language: "js", filePath: "b.js", symbolName: "target", symbolKind: "function" },
+		];
+		const result = aggregateGraphToFiles(makeGraph(nodes, [
+			{ from: "a.ts#run", to: "b.ts#target", kind: "calls" },
+			{ from: "a.js#run", to: "b.js#target", kind: "calls" },
+		]));
+		expect(result.compiledTwinCount).toBe(2);
+		expect(result.nodes.find((node) => node.id === idFor("a.ts"))?.symbolCount).toBe(1);
+		expect(result.nodes.find((node) => node.id === idFor("b.ts"))?.symbolCount).toBe(1);
+		expect(result.edges).toEqual([{ from: idFor("a.ts"), to: idFor("b.ts"), weight: 1 }]);
+	});
+
+	it("merges multiple compiled siblings onto one source identity", () => {
+		const nodes: ReviewGraphNode[] = [
+			{ id: "src.ts#file", kind: "file", language: "ts", filePath: "src.ts" },
+			{ id: "src.js#file", kind: "file", language: "js", filePath: "src.js" },
+			{ id: "src.mjs#file", kind: "file", language: "js", filePath: "src.mjs" },
+			{ id: "dep.ts#file", kind: "file", language: "ts", filePath: "dep.ts" },
+			{ id: "dep.js#file", kind: "file", language: "js", filePath: "dep.js" },
+			{ id: "dep.mjs#file", kind: "file", language: "js", filePath: "dep.mjs" },
+			{ id: "src.ts#run", kind: "symbol", language: "ts", filePath: "src.ts", symbolName: "run", symbolKind: "function" },
+			{ id: "src.js#run", kind: "symbol", language: "js", filePath: "src.js", symbolName: "run", symbolKind: "function" },
+			{ id: "src.mjs#run", kind: "symbol", language: "js", filePath: "src.mjs", symbolName: "run", symbolKind: "function" },
+			{ id: "dep.ts#target", kind: "symbol", language: "ts", filePath: "dep.ts", symbolName: "target", symbolKind: "function" },
+			{ id: "dep.js#target", kind: "symbol", language: "js", filePath: "dep.js", symbolName: "target", symbolKind: "function" },
+			{ id: "dep.mjs#target", kind: "symbol", language: "js", filePath: "dep.mjs", symbolName: "target", symbolKind: "function" },
+		];
+		const result = aggregateGraphToFiles(makeGraph(nodes, [
+			{ from: "src.ts#run", to: "dep.ts#target", kind: "calls" },
+			{ from: "src.js#run", to: "dep.js#target", kind: "calls" },
+			{ from: "src.mjs#run", to: "dep.mjs#target", kind: "calls" },
+		]));
+		expect(result.compiledTwinCount).toBe(4);
+		expect(result.nodes).toHaveLength(2);
+		expect(result.nodes.find((node) => node.id === idFor("src.ts"))?.symbolCount).toBe(1);
+		expect(result.nodes.find((node) => node.id === idFor("dep.ts"))?.symbolCount).toBe(1);
+		expect(result.edges).toEqual([{ from: idFor("src.ts"), to: idFor("dep.ts"), weight: 1 }]);
+	});
+
+	it("dedupes absolute multi-twin sets after native path normalization", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-map-twins-"));
+		try {
+			const source = path.join(root, "src.ts");
+			const sourceTwins = [
+				path.join(root, "src.js").replaceAll(path.sep, "/"),
+				path.join(root, "src.mjs"),
+				path.join(root, "src.cjs"),
+			];
+			const dep = path.join(root, "dep.ts");
+			const depTwins = [
+				path.join(root, "dep.js"),
+				path.join(root, "dep.mjs").replaceAll(path.sep, "/"),
+				path.join(root, "dep.cjs"),
+			];
+			for (const file of [source, ...sourceTwins, dep, ...depTwins]) {
+				fs.writeFileSync(file, "");
+			}
+			const nodes: ReviewGraphNode[] = [];
+			const edges: ReviewGraphEdge[] = [];
+			const addFile = (file: string, prefix: string, kind: string) => {
+				nodes.push({ id: `${prefix}:file`, kind: "file", language: kind, filePath: file });
+				nodes.push({
+					id: `${prefix}:run`,
+					kind: "symbol",
+					language: kind,
+					filePath: file,
+					symbolName: prefix.startsWith("dep") ? "target" : "run",
+					symbolKind: kind === "ts" ? "function" : "variable",
+				});
+			};
+			addFile(source, "src-ts", "ts");
+			addFile(dep, "dep-ts", "ts");
+			for (const [index, file] of sourceTwins.entries()) addFile(file, `src-${index}`, "js");
+			for (const [index, file] of depTwins.entries()) addFile(file, `dep-${index}`, "js");
+			edges.push({ from: "src-ts:run", to: "dep-ts:run", kind: "calls" });
+			for (let index = 0; index < sourceTwins.length; index += 1) {
+				edges.push({ from: `src-${index}:run`, to: `dep-${index}:run`, kind: "calls" });
+			}
+
+			const result = aggregateGraphToFiles(makeGraph(nodes, edges));
+			expect(result.compiledTwinCount).toBe(6);
+			expect(result.nodes).toHaveLength(2);
+			expect(result.nodes.find((node) => node.id === idFor(source))?.symbolCount).toBe(1);
+			expect(result.nodes.find((node) => node.id === idFor(dep))?.symbolCount).toBe(1);
+			expect(result.edges).toEqual([{ from: idFor(source), to: idFor(dep), weight: 1 }]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("drops untracked-gitignored files via excludeIds — unless a surviving twin merge rescues them", () => {
 		const nodes: ReviewGraphNode[] = [
 			// Tracked source — stays (not in excludeIds).
@@ -254,9 +353,9 @@ describe("aggregateGraphToFiles", () => {
 			weight: 1,
 		});
 
-		// Symbol counts merge: a.ts's own symbol + the twin a.js's symbol.
+		// Compiled twins are one logical source symbol, not duplicate evidence.
 		const aNode = result.nodes.find((n) => n.id === idFor("a.ts"));
-		expect(aNode?.symbolCount).toBe(2);
+		expect(aNode?.symbolCount).toBe(1);
 		// The merged node keeps the SOURCE file's language.
 		expect(aNode?.language).toBe("ts");
 	});

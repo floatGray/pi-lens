@@ -73,7 +73,7 @@ This avoids spending time on a direction the maintainers may not accept.
 | Host adapters | `index.ts`, `mcp/server.ts` | pi extension entry and MCP mirror. New capabilities must go through `clients/lens-engine.ts` — never reach into internals from `mcp/server.ts`. |
 | Dispatch | `clients/dispatch/` | Runner registry, groups, diagnostics merging, cascade. |
 | Runners | `clients/dispatch/runners/*.ts` | One file per tool. Registered in `clients/dispatch/runners/index.ts`. |
-| LSP | `clients/lsp/server.ts`, `clients/lsp/config.ts`, `clients/lsp/server-strategies.ts` | Language server definitions, custom config, diagnostic strategies. |
+| LSP | `clients/lsp/server.ts`, `clients/lsp/config.ts`, `clients/lsp/wait-policy/strategies.ts` | Language server definitions, custom config, diagnostic strategies. |
 | Installers | `clients/installer/index.ts` | Auto-install registry for npm/pip/gem/GitHub/maven/archive tools. |
 | Formatters | `clients/formatters.ts` | Formatter selection and execution. |
 | Rules | `rules/ast-grep-rules/`, `rules/tree-sitter-queries/` | Static analysis rules. |
@@ -128,7 +128,7 @@ Language servers are defined in `clients/lsp/server.ts`.
 
 3. **If it's a primary server**, make sure `clients/lsp/config.ts` `getServersForFileWithConfig` will route files to it.
 
-4. **Add a diagnostic strategy** in `clients/lsp/server-strategies.ts` if the server has unusual push/pull behavior.
+4. **Add a diagnostic strategy** in `clients/lsp/wait-policy/strategies.ts` if the server has unusual push/pull behavior.
 
 5. **Add a smoke fixture** in `scripts/smoke-tools.mjs` `LSP_FIXTURES`.
    - `tests/clients/lsp/lsp-fixture-coverage.test.ts` fails if a registered non-auxiliary server has no fixture (or exemption).
@@ -148,7 +148,7 @@ Auxiliary servers are cross-cutting scanners (security, structural, secrets) tha
    - `killSwitchFlag` and `enabledByDefault`
    - `allowBlocking` and `semantic` policy
 3. Add a fixture with `auxiliaryServerIds` in `scripts/smoke-tools.mjs`.
-4. Add/update `SERVER_DIAGNOSTIC_STRATEGIES` in `clients/lsp/server-strategies.ts` if needed.
+4. Add/update `SERVER_DIAGNOSTIC_STRATEGIES` in `clients/lsp/wait-policy/strategies.ts` if needed.
 
 ## Adding a formatter
 

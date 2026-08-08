@@ -47,6 +47,7 @@ import {
 	projectReport,
 	projectScan,
 	readEnclosing,
+	generatedSkipNotice,
 	readSymbol,
 	recentLatency,
 	renderCompactModuleReport,
@@ -550,6 +551,14 @@ const ALL_TOOLS = [
 			properties: {
 				cwd: { type: "string" },
 				maxFiles: { type: "number", description: "Cap files scanned." },
+				includeGenerated: {
+					type: "boolean",
+					description:
+						"Scan WITHOUT the generated/artifact NAME-heuristic filter " +
+						"(lockfiles, gen.ts-style names, generated/ dirs, …). Default " +
+						"false. Use when a scan's 'excluded by generated-name " +
+						"heuristics' notice suggests a real file was skipped.",
+				},
 			},
 		},
 	},
@@ -610,7 +619,9 @@ const ALL_TOOLS = [
 			"(this path never calls LSP). `semantic.source` reports whether graph " +
 			"data was used. Pass `blastRadius: true` for the cross-file blast radius " +
 			"(transitive dependents as ranked file reads, read-only over the cached " +
-			'graph). `view: "compact"` returns a line-oriented text rendering ' +
+			"graph). Pass `callGraph: true` for bounded derived callers/callees; a " +
+			"cold or stale call-graph cache is reported explicitly, never as zero calls. " +
+			'`view: "compact"` returns a line-oriented text rendering ' +
 			"(cheapest option) instead of JSON. An outline shows shape, not bodies.",
 		inputSchema: {
 			type: "object",
@@ -644,6 +655,15 @@ const ALL_TOOLS = [
 					type: "number",
 					description:
 						"Max hops for the blast-radius walk (default 3). Only used with blastRadius.",
+				},
+				callGraph: {
+					type: "boolean",
+					description:
+						"Include bounded derived callers/callees from the cached FunctionCallGraph; cold or stale cache state is explicit.",
+				},
+				maxCallGraphEntries: {
+					type: "number",
+					description: "Per-direction cap for call-graph relations (default 20).",
 				},
 			},
 			required: ["file"],
@@ -979,7 +999,8 @@ async function callTool(
 			typeof args.maxFiles === "number" && Number.isFinite(args.maxFiles)
 				? Math.max(1, Math.floor(args.maxFiles))
 				: undefined;
-		const snapshot = await projectScan(cwd, maxFiles);
+		const includeGenerated = args.includeGenerated === true;
+		const snapshot = await projectScan(cwd, maxFiles, includeGenerated);
 		// #747: a cwd at/above $HOME refuses to walk — say so instead of letting
 		// "Scanned 0 file(s) → 0 diagnostics" read as a clean project.
 		if (snapshot.unsafeRoot) {
@@ -1008,6 +1029,10 @@ async function callTool(
 		// explicitly — mirrors the #777 warm-skip notify's override-hint wording.
 		const truncationNotice = scanTruncationNotice(snapshot);
 		if (truncationNotice) summaryLines.push(truncationNotice);
+		// #1107 phase 2: same "reached the seam but nothing rendered it" gap as
+		// #784's scanTruncationNotice, for the generated-name skip counters.
+		const skipNotice = generatedSkipNotice(snapshot);
+		if (skipNotice) summaryLines.push(skipNotice);
 		return toolText(summaryLines.join("\n"), {
 			filesScanned: snapshot.filesScanned,
 			runners: snapshot.runners,
@@ -1019,6 +1044,15 @@ async function callTool(
 			...(snapshot.scanTruncated ? { scanTruncated: true } : {}),
 			...(snapshot.treeSitterStatus
 				? { treeSitterStatus: snapshot.treeSitterStatus }
+				: {}),
+			...(snapshot.generatedFileSkips
+				? { generatedFileSkips: snapshot.generatedFileSkips }
+				: {}),
+			...(snapshot.generatedNameOnlySkips
+				? { generatedNameOnlySkips: snapshot.generatedNameOnlySkips }
+				: {}),
+			...(snapshot.generatedDirSkips
+				? { generatedDirSkips: snapshot.generatedDirSkips }
 				: {}),
 		});
 	}
@@ -1133,6 +1167,12 @@ async function callTool(
 			Number.isFinite(args.blastRadiusDepth)
 				? Math.max(1, Math.floor(args.blastRadiusDepth))
 				: undefined;
+		const callGraph = args.callGraph === true;
+		const maxCallGraphEntries =
+			typeof args.maxCallGraphEntries === "number" &&
+			Number.isFinite(args.maxCallGraphEntries)
+				? Math.max(1, Math.floor(args.maxCallGraphEntries))
+				: undefined;
 		const view =
 			args.view === "summary" || args.view === "compact" ? args.view : undefined;
 		const focus = typeof args.focus === "string" ? args.focus : undefined;
@@ -1140,6 +1180,8 @@ async function callTool(
 			maxRefsPerSymbol,
 			blastRadius,
 			blastRadiusDepth,
+			callGraph,
+			maxCallGraphEntries,
 			view,
 			focus,
 		});

@@ -1082,7 +1082,7 @@ const LSP_DIAGNOSTICS_WAIT_MS = 8000;
 // Auxiliary scanners (opengrep, ast-grep, zizmor) compile their rules on the
 // FIRST scan of a session and may cache a late result that — by design —
 // "surfaces on the next edit" (see the opengrep strategy in
-// clients/lsp/server-strategies.ts: a cold scan that overruns aggregateWaitMs
+// clients/lsp/wait-policy/strategies.ts: a cold scan that overruns aggregateWaitMs
 // isn't lost, it lands on the next touch). The smoke does a single touch, so a
 // cold rule-load that overran the deadline left this layer asserting 0
 // diagnostics and reddening the nightly (a flake, not a real break). We instead

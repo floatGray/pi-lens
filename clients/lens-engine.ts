@@ -111,12 +111,20 @@ export function recentLatency(
 	return reports.slice(-limit).reverse();
 }
 
-/** Cheap project-wide scan (tree-sitter + fact rules). */
+/**
+ * Cheap project-wide scan (tree-sitter + fact rules).
+ *
+ * `includeGenerated` (#1107 phase 2 review): scan WITHOUT the generated/
+ * artifact NAME-heuristic filter — the actionable opt-out
+ * `generatedSkipNotice` below points a user at. Default `false` (existing
+ * filtering behavior unchanged).
+ */
 export function projectScan(
 	cwd: string,
 	maxFiles?: number,
+	includeGenerated?: boolean,
 ): Promise<ProjectDiagnosticsSnapshot> {
-	return scanProjectDiagnostics({ cwd, tier: "cheap", maxFiles });
+	return scanProjectDiagnostics({ cwd, tier: "cheap", maxFiles, includeGenerated });
 }
 
 /**
@@ -143,6 +151,58 @@ export function scanTruncationNotice(
 	return (
 		`⚠ Scan truncated at ${snapshot.filesScanned} file(s) — results are partial; ` +
 		"raise maxProjectFiles in .pi-lens.json to scan fully."
+	);
+}
+
+/**
+ * #1107 phase 2: `generatedNameOnlySkips`/`generatedDirSkips` reach this seam
+ * via `ProjectDiagnosticsSnapshot` but need explicit rendering, same pattern
+ * as `scanTruncationNotice` above — otherwise a user has no way to learn the
+ * generated-name heuristic silently excluded files/directories short of
+ * reading `latency.log`'s `source_walk_skip_summary` line directly.
+ *
+ * #1107 phase 2 review round 2 (P1, empirically proven): this deliberately
+ * keys off `generatedNameOnlySkips`, NOT the raw `generatedFileSkips` total.
+ * `generatedFileSkips` counts every file the generated/artifact heuristic
+ * skipped, including STRONG evidence (lockfiles, declaration files, minified/
+ * bundle/chunk output — expected on nearly every real repo) and
+ * content-CONFIRMED WEAK matches (the escape hatch checked and a genuine
+ * generated-code header was present). Keying the notice off that total meant
+ * a repo with nothing more unusual than a `package-lock.json` and an ambient
+ * `.d.ts` showed "2 file(s) excluded" on literally every scan forever — the
+ * signal drowned itself on day one. `generatedNameOnlySkips` is the narrower,
+ * genuinely at-risk residual: a WEAK name match trusted with NO corroborating
+ * evidence check at all (only reachable when a caller opts out of the header
+ * probe — source-filter.ts's default project-walk path always enables it).
+ * Post-escape-hatch, this should be rare-to-zero on the default path, which
+ * is exactly what makes the notice meaningful again when it DOES fire.
+ * `generatedDirSkips` stays in the trigger condition unchanged: directory-
+ * level pruning has no escape hatch at all (the walk never enumerates a
+ * pruned directory's contents to check them), so it is always a genuine
+ * "real files may be hiding in here, unverified" signal, not a
+ * false-positive-prone one — see `generatedDirSkips`'s doc on
+ * `SourceCollectionResult`.
+ *
+ * Returns `undefined` when neither counter is set (nothing to append).
+ */
+export function generatedSkipNotice(
+	snapshot: Pick<
+		ProjectDiagnosticsSnapshot,
+		"generatedNameOnlySkips" | "generatedDirSkips"
+	>,
+): string | undefined {
+	const files = snapshot.generatedNameOnlySkips ?? 0;
+	const dirs = snapshot.generatedDirSkips ?? 0;
+	if (files === 0 && dirs === 0) return undefined;
+	const parts: string[] = [];
+	if (files > 0) parts.push(`${files} file(s)`);
+	if (dirs > 0) parts.push(`${dirs} director${dirs === 1 ? "y" : "ies"}`);
+	return (
+		`ℹ ${parts.join(" and ")} excluded by generated-name heuristics with no ` +
+		"confirming evidence — a real hand-written file/directory whose name " +
+		"looks generated (e.g. `gen.ts`, `generated/`) can be excluded too; " +
+		"pass includeGenerated: true to pilens_project_scan / lens_diagnostics " +
+		"to scan without this filter if you suspect a false skip."
 	);
 }
 

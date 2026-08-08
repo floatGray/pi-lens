@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { buildOrUpdateGraph } from "../../../clients/review-graph/builder.js";
-import { buildSymbolId } from "../../../clients/review-graph/symbol-id.js";
+import {
+	buildSymbolId,
+	parseSymbolKey,
+} from "../../../clients/review-graph/symbol-id.js";
 import { createTempFile, setupTestEnvironment } from "../test-utils.js";
 
 // refs #655 (narrow first slice): collision-safe symbol-graph node IDs.
@@ -106,4 +109,72 @@ describe("collision-safe symbol IDs (#655)", () => {
 			}
 		},
 	);
+});
+
+// refs #1088 P2: parseSymbolKey mis-parses LSP-fallback kinds.
+//
+// buildSymbolId only ever mints the 7 kinds in the (now-removed) hard-coded
+// whitelist, but addLspFallbackSymbols mints canonical-shaped ids using
+// lspSymbolKindName's much larger vocabulary — "enum", "constant", "struct",
+// "namespace", "field", "constructor", "module", and the numeric catch-all
+// "lsp-symbol-<n>" for unmapped LSP SymbolKind values. Under the whitelist,
+// any of those ids failed the kind check and fell through to the legacy
+// last-colon split, which shears the id at the WRONG boundary (the line
+// number becomes the "name", and the kind+name become part of the "file
+// path"). The fix matches the trailing `:<kind-token>:<digits>` shape
+// structurally instead of whitelisting specific kind strings.
+describe("parseSymbolKey (#1088 P2 — LSP-fallback kinds)", () => {
+	it("parses a canonical id whose kind is in the original 7-kind whitelist", () => {
+		const parsed = parseSymbolKey("src/service.ts:run:method:6");
+		expect(parsed).toEqual({
+			filePath: "src/service.ts",
+			symbolName: "run",
+			kind: "method",
+			line: 6,
+		});
+	});
+
+	it("parses a canonical id minted with an LSP-fallback kind ('enum')", () => {
+		// The issue's concrete repro shape, incl. a Windows drive-letter path
+		// whose own colon must NOT be mistaken for a field separator.
+		const parsed = parseSymbolKey("c:\\p\\a.kt:Color:enum:42");
+		expect(parsed).toEqual({
+			filePath: "c:\\p\\a.kt",
+			symbolName: "Color",
+			kind: "enum",
+			line: 42,
+		});
+	});
+
+	it("parses canonical ids for the rest of the LSP-fallback vocabulary", () => {
+		const cases: Array<[string, string]> = [
+			["src/a.ts:MAX:constant:10", "constant"],
+			["src/a.ts:Shape:struct:3", "struct"],
+			["src/a.ts:app:namespace:1", "namespace"],
+			["src/a.ts:count:field:7", "field"],
+			["src/a.ts:Widget:constructor:2", "constructor"],
+			["src/a.ts:utils:module:1", "module"],
+			// The numeric catch-all lspSymbolKindName emits for an unmapped
+			// LSP SymbolKind number.
+			["src/a.ts:Mystery:lsp-symbol-99:5", "lsp-symbol-99"],
+			// Hyphenated LSP kinds (SYMBOL_KIND_NAMES itself, not just the
+			// numeric catch-all).
+			["src/a.ts:Foo:enum-member:8", "enum-member"],
+			["src/a.ts:T:type-parameter:1", "type-parameter"],
+		];
+		for (const [key, expectedKind] of cases) {
+			const parsed = parseSymbolKey(key);
+			expect(parsed.kind).toBe(expectedKind);
+			expect(parsed.filePath).toBe("src/a.ts");
+			expect(typeof parsed.line).toBe("number");
+		}
+	});
+
+	it("still falls back to the legacy file:name split for non-canonical ids", () => {
+		const parsed = parseSymbolKey("src/service.ts:helper");
+		expect(parsed).toEqual({
+			filePath: "src/service.ts",
+			symbolName: "helper",
+		});
+	});
 });

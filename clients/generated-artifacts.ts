@@ -9,6 +9,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isWindowsPath } from "./path-utils.js";
 
 const DEFAULT_HEADER_BYTES = 4096;
 
@@ -66,6 +67,31 @@ const GENERATED_FILE_PATTERNS = [
 	/\.sql\.(go|ts|js)$/i,
 	/_sqlc\.go$/i,
 	/\.g\.([jt]sx?|mjs|cjs|rs|go)$/i,
+];
+
+// #1107 phase 2 review (P2, maintainer decision): minified/bundle/chunk
+// output is intentionally NOT eligible for the content-probe escape hatch
+// below and lives in the STRONG tier instead, alongside lockfiles — the
+// escape hatch's premises fail structurally for this class:
+//  - Hand-written-with-this-name probability is ~0 (nobody names a source
+//    file `app.min.js`/`vendor.bundle.js` by hand).
+//  - The header-probe leg is dead for it: minifiers strip comments/banners
+//    by design, so a real minified bundle essentially never carries a
+//    `GENERATED_HEADER_PATTERNS` match — the probe can never confirm it, so
+//    under the WEAK-tier escape hatch this class would ALWAYS be "kept" via
+//    the no-evidence branch, not "kept sometimes." That inverts the
+//    heuristic from "usually right, occasionally rescued" to "never right."
+//  - The sibling-probe leg is also dead for it: `findSourceSibling` looks
+//    for a `.ts`/`.tsx`/etc. twin at the SAME stem (`app.min.ts` next to
+//    `app.min.js`), which is never how minified bundles are produced — the
+//    real source twin is `app.ts`/`app.js` at a DIFFERENT stem, which the
+//    sibling probe does not check. So the "does a hand-written source twin
+//    exist" question this class actually needs answered is structurally
+//    unreachable, not merely unresolved.
+// Both dead legs mean this class would be a permanent override — never
+// re-confirmed by either evidence check — so it is excluded from the WEAK
+// tier entirely and always skipped, like a lockfile.
+const MINIFIED_BUNDLE_FILE_PATTERNS = [
 	/\.min\.(js|mjs|cjs|css)$/i,
 	/\.(bundle|chunk)\.(js|mjs|cjs|css)$/i,
 ];
@@ -90,16 +116,48 @@ function pathSegments(filePath: string): string[] {
 		.filter(Boolean);
 }
 
+/**
+ * Shape-aware basename: a WINDOWS-SHAPED path (drive letter or UNC prefix,
+ * per `isWindowsPath`) is parsed with `path.win32.basename` regardless of the
+ * running OS, mirroring the `detectFileRole` fix in `file-role.ts` (refs
+ * #1152, #1150, #1161 — defect shape 2: a host-default `path` fn inside a
+ * shape-committed branch follows the *host* OS, so on Linux CI a `C:\...`
+ * path has no POSIX separator and the module-default `basename` returns the
+ * whole string unchanged, missing exact-name lookups like `LOCKFILE_NAMES`).
+ * Native same-OS paths (POSIX on Linux, win32 on Windows) are unaffected —
+ * on win32 this is a no-op since `win32.basename` already equals the module
+ * default there.
+ */
+function basenameForShape(filePath: string): string {
+	return isWindowsPath(filePath)
+		? path.win32.basename(filePath)
+		: path.basename(filePath);
+}
+
 export function isGeneratedArtifactDirectoryName(dirName: string): boolean {
 	return GENERATED_DIR_NAMES.has(dirName.trim().toLowerCase());
 }
 
 export function isDeclarationFile(filePath: string): boolean {
-	const base = path.basename(filePath).toLowerCase();
+	const base = basenameForShape(filePath).toLowerCase();
 	return DECLARATION_FILE_PATTERNS.some((pattern) => pattern.test(base));
 }
 
-function hasGeneratedArtifactPath(filePath: string): boolean {
+/**
+ * STRONG evidence a path is generated/artifact output: it lives under a
+ * directory segment that itself looks generated (`generated/`, `codegen/`,
+ * …), its basename is a known package-manager lockfile, or it matches a
+ * minified/bundle/chunk output pattern (see
+ * {@link MINIFIED_BUNDLE_FILE_PATTERNS}'s doc for why that class is STRONG,
+ * not WEAK). All three are treated as conclusive — no content-probe escape
+ * hatch (#1107 phase 2) applies to any of them. A lockfile is never
+ * hand-written; a generated-dir SEGMENT match here only fires for callers
+ * that check a single path without having walked (directory-level pruning
+ * already removes the walk-time case in `shouldRecurseIntoDir`, so this
+ * branch is effectively a belt-and-braces check for non-walk callers like
+ * `file-role.ts` and `project-scan-policy.ts`).
+ */
+function hasStrongGeneratedArtifactPath(filePath: string): boolean {
 	const segments = pathSegments(filePath);
 	const dirSegments = segments.slice(0, -1);
 	if (
@@ -108,8 +166,26 @@ function hasGeneratedArtifactPath(filePath: string): boolean {
 		return true;
 	}
 
-	const base = path.basename(filePath);
+	const base = basenameForShape(filePath);
 	if (LOCKFILE_NAMES.has(base.toLowerCase())) return true;
+	return MINIFIED_BUNDLE_FILE_PATTERNS.some((pattern) => pattern.test(base));
+}
+
+/**
+ * WEAK evidence: the basename alone matches a generated-file NAME pattern
+ * (e.g. `gen.ts`, `foo_generated.go`, `user.pb.go`). Unlike the strong path
+ * check above, a name-only match is not conclusive — a hand-written file can
+ * innocently contain "gen" in its name. #1107 phase 2's content-probe escape
+ * hatch (see `classifyGeneratedOrArtifactDetailed`) requires corroborating
+ * evidence (a source sibling, checked upstream by walk-driven callers, or a
+ * generated-code header) before treating a WEAK-only match as an artifact.
+ * Minified/bundle/chunk output (`bar.min.js`, `vendor.bundle.js`) is
+ * deliberately NOT in this WEAK set — see
+ * {@link MINIFIED_BUNDLE_FILE_PATTERNS}'s doc for why that class is STRONG
+ * instead (the escape hatch's evidence checks are structurally dead for it).
+ */
+function hasWeakGeneratedFileNamePattern(filePath: string): boolean {
+	const base = basenameForShape(filePath);
 	return GENERATED_FILE_PATTERNS.some((pattern) => pattern.test(base));
 }
 
@@ -181,23 +257,145 @@ function fileHeaderLooksGenerated(filePath: string, maxBytes: number): boolean {
 	return verdict;
 }
 
+/**
+ * Verdict of {@link classifyGeneratedOrArtifact}:
+ *  - `"generated"`: confirmed generated/artifact output — skip it. Either a
+ *    STRONG path match (generated dir segment, lockfile, minified/bundle/
+ *    chunk output), an explicit declaration-file opt-in, a confirmed
+ *    generated-code content header, or (only when no header probe was
+ *    possible/enabled) a WEAK name-only match falling back to the
+ *    pre-#1107-phase-2 trust-the-name behavior.
+ *  - `"override"`: #1107 phase 2's content-probe escape hatch fired — a WEAK
+ *    name-only match (e.g. `gen.ts`) that a content-header probe did NOT
+ *    confirm. Kept, not skipped; callers that track observability should
+ *    count this distinctly from a genuine `"clean"` (never-flagged) file so
+ *    the heuristic's rescues stay visible.
+ *  - `"clean"`: no evidence at all — never matched any heuristic.
+ */
+export type GeneratedArtifactVerdict = "generated" | "override" | "clean";
+
+/**
+ * WHICH evidence produced a `"generated"` verdict (undefined for `"override"`/
+ * `"clean"`) — #1107 phase 2 review: a tool-facing skip notice must not treat
+ * every `"generated"` verdict as equally "at risk," or it fires permanently
+ * on every real repo (a `package-lock.json` alone would trip it forever).
+ *  - `"strong"`: STRONG path evidence (generated dir segment, lockfile,
+ *    minified/bundle/chunk output) or the explicit declaration-file opt-in —
+ *    no content probe involved, conclusive by construction. Expected on
+ *    almost every repo and NOT a coverage-hole signal.
+ *  - `"content"`: a WEAK name match CONFIRMED by a generated-code header (or
+ *    caller-supplied `content`) — the escape hatch checked and the evidence
+ *    came back positive. Also not a coverage-hole signal: this is exactly
+ *    the case #1107 phase 2 wanted to keep skipping.
+ *  - `"name-only"`: a WEAK name match trusted with NO corroborating evidence
+ *    check performed at all — only reachable when the caller supplied
+ *    neither `content` nor `readContentHeader:true` (source-filter.ts's
+ *    default project-walk path always enables the header probe, so this
+ *    should be rare-to-zero in practice; it exists for callers that opt out
+ *    of the probe for performance and therefore get the old, unverified
+ *    trust-the-name behavior). This is the ONLY residual "at risk" bucket
+ *    the #1107 phase 2 escape hatch could not evaluate — a tool-facing
+ *    notice should key off this, not the full `"generated"` count.
+ */
+export type GeneratedArtifactEvidence = "strong" | "content" | "name-only";
+
+export interface GeneratedArtifactClassification {
+	verdict: GeneratedArtifactVerdict;
+	/** Only set when `verdict === "generated"`. See {@link GeneratedArtifactEvidence}. */
+	evidence?: GeneratedArtifactEvidence;
+}
+
+/**
+ * The full verdict (+ evidence tier) behind {@link isGeneratedOrArtifact}'s
+ * boolean, exposing the #1107 phase 2 content-probe escape hatch: a WEAK
+ * name-only match (see {@link hasWeakGeneratedFileNamePattern}) is no longer
+ * skipped on the name alone — it additionally requires a generated-code
+ * header in the first few KB (`hasGeneratedArtifactContent`/
+ * `fileHeaderLooksGenerated`) before being treated as an artifact. Evidence
+ * check order is cheapest-first: STRONG path (dir segment/lockfile/minified-
+ * bundle, no filesystem probe) → declaration opt-in → content/header probe,
+ * so the (often already-open) file read only happens for the WEAK-match case
+ * that actually needs it.
+ *
+ * Evidence class (a) from the issue — "does a higher-precedence hand-written
+ * source SIBLING exist?" — is deliberately NOT re-implemented here: it is
+ * `source-filter.ts`'s `findSourceSibling`/`isBuildArtifact` (this module has
+ * no filesystem-sibling-probe cache, and `source-filter.ts` already imports
+ * this module, so adding a reverse import would be circular). Both call
+ * sites that matter (`classifyEntry`, `filterSourceFiles` in
+ * `source-filter.ts`) already probe for a sibling BEFORE reaching this
+ * function and short-circuit on a hit, so by the time this function runs for
+ * those callers evidence (a) has already come back negative. Non-walk
+ * callers with no upstream sibling probe (`file-role.ts`'s content-based
+ * check, `project-scan-policy.ts`'s single-path `shouldSkipProjectPath`)
+ * evaluate evidence (b) only — a documented, narrower guarantee than the
+ * walk path's.
+ *
+ * Tradeoff (documented per the issue): when NEITHER piece of evidence
+ * confirms a WEAK name match, the file is KEPT. This can rescue a real
+ * headerless generated file with no source twin into a walk/graph/index that
+ * previously silently dropped it — accepted per #1107: a false-KEEP (an
+ * agent sees one extra file it must itself judge) is strictly less harmful
+ * than a silent false-DROP (a real file invisibly never analyzed at all).
+ * This tradeoff deliberately does NOT extend to minified/bundle/chunk output
+ * — see {@link MINIFIED_BUNDLE_FILE_PATTERNS}'s doc for why that class is
+ * STRONG (always skipped, no escape hatch) rather than WEAK.
+ */
+export function classifyGeneratedOrArtifactDetailed(
+	filePath: string,
+	options: GeneratedArtifactOptions = {},
+): GeneratedArtifactClassification {
+	if (hasStrongGeneratedArtifactPath(filePath)) {
+		return { verdict: "generated", evidence: "strong" };
+	}
+	if (options.includeDeclarations && isDeclarationFile(filePath)) {
+		return { verdict: "generated", evidence: "strong" };
+	}
+
+	const weakNameMatch = hasWeakGeneratedFileNamePattern(filePath);
+
+	if (options.content !== undefined) {
+		if (hasGeneratedArtifactContent(options.content)) {
+			return { verdict: "generated", evidence: "content" };
+		}
+		return { verdict: weakNameMatch ? "override" : "clean" };
+	}
+
+	if (options.readContentHeader) {
+		if (
+			fileHeaderLooksGenerated(
+				filePath,
+				options.maxHeaderBytes ?? DEFAULT_HEADER_BYTES,
+			)
+		) {
+			return { verdict: "generated", evidence: "content" };
+		}
+		return { verdict: weakNameMatch ? "override" : "clean" };
+	}
+
+	// No content/header probe was supplied or enabled: there is no cheap way
+	// to evaluate evidence (b) here, so a WEAK name match falls back to the
+	// pre-#1107-phase-2 behavior (trust the name, skip it) rather than
+	// silently activating the escape hatch for callers that opted out of the
+	// probe for performance. The escape hatch only activates when a header
+	// probe actually ran and did not confirm. Evidence "name-only" — the one
+	// residual at-risk bucket, see {@link GeneratedArtifactEvidence}.
+	return weakNameMatch
+		? { verdict: "generated", evidence: "name-only" }
+		: { verdict: "clean" };
+}
+
+/** Verdict-only convenience wrapper over {@link classifyGeneratedOrArtifactDetailed}. */
+export function classifyGeneratedOrArtifact(
+	filePath: string,
+	options: GeneratedArtifactOptions = {},
+): GeneratedArtifactVerdict {
+	return classifyGeneratedOrArtifactDetailed(filePath, options).verdict;
+}
+
 export function isGeneratedOrArtifact(
 	filePath: string,
 	options: GeneratedArtifactOptions = {},
 ): boolean {
-	if (hasGeneratedArtifactPath(filePath)) return true;
-	if (options.includeDeclarations && isDeclarationFile(filePath)) return true;
-
-	if (options.content !== undefined) {
-		return hasGeneratedArtifactContent(options.content);
-	}
-
-	if (options.readContentHeader) {
-		return fileHeaderLooksGenerated(
-			filePath,
-			options.maxHeaderBytes ?? DEFAULT_HEADER_BYTES,
-		);
-	}
-
-	return false;
+	return classifyGeneratedOrArtifact(filePath, options) === "generated";
 }

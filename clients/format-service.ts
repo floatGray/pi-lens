@@ -152,10 +152,16 @@ export class FormatService {
 		const results: FormatterResult[] = [];
 
 		for (const formatter of formatters) {
+			// #1097: keep the timer handle so it can be cleared once the race
+			// settles. An uncleared, REF'D 30s setTimeout that outlives a fast
+			// `formatFile` win would keep a one-shot `pi --print` process alive for
+			// up to 30s after completion (same uncleared-race-timeout class as the
+			// LSP client-wait leak fixed in clients/lsp/index.ts).
+			let formatTimer: ReturnType<typeof setTimeout> | undefined;
 			try {
 				const timeoutMs = 30000;
 				const timeoutPromise = new Promise<FormatterResult>((_, reject) => {
-					setTimeout(
+					formatTimer = setTimeout(
 						() =>
 							reject(
 								new Error(
@@ -177,6 +183,8 @@ export class FormatService {
 					changed: false,
 					error: error instanceof Error ? error.message : String(error),
 				});
+			} finally {
+				if (formatTimer) clearTimeout(formatTimer);
 			}
 		}
 

@@ -71,6 +71,23 @@ export interface WordIndex {
 	forward?: PathKeyedMap<Map<string, number>>;
 	/** File mtimes captured when each document was tokenized (#958). */
 	fileMtimes: PathKeyedMap<number>;
+	/**
+	 * File byte sizes captured when each document was tokenized (#1105). The
+	 * incremental refresh gate is mtime-first (cheap, from the stat it already
+	 * runs) but mtime alone is a stale signal: a content change that PRESERVES
+	 * mtime (git checkout timestamp restoration, a formatter that preserves
+	 * mtime, a same-second/same-clock write) would leave the old postings serving
+	 * stale identifiers to symbol_search. Size is the free second axis of the
+	 * review-graph gold-standard `size:mtimeMs` signature (builder.ts's
+	 * `sourceSignatureEntry`) — the walk already reads `stat.size` to enforce the
+	 * byte cap, so comparing it costs nothing yet catches every content change
+	 * that alters length. The residual (same mtime AND same byte length, changed
+	 * content) matches review-graph's own accepted residual; closing it would
+	 * require reading+hashing every REUSED file on every refresh (the blind skip
+	 * path), which is exactly the unconditional hot-path hashing the event-loop
+	 * discipline forbids.
+	 */
+	fileSizes: PathKeyedMap<number>;
 }
 
 export interface RankedFile {
@@ -173,7 +190,12 @@ export function tokenizeLine(line: string): string[] {
  * that repeats an identifier. Document length is the total indexed token count.
  */
 export function buildWordIndex(
-	files: Array<{ path: string; content: string; mtimeMs?: number }> & {
+	files: Array<{
+		path: string;
+		content: string;
+		mtimeMs?: number;
+		size?: number;
+	}> & {
 		truncated?: boolean;
 	},
 ): WordIndex {
@@ -181,9 +203,10 @@ export function buildWordIndex(
 	const docLengths = new PathKeyedMap<number>(wordIndexKey);
 	const forward = new PathKeyedMap<Map<string, number>>(wordIndexKey);
 	const fileMtimes = new PathKeyedMap<number>(wordIndexKey);
+	const fileSizes = new PathKeyedMap<number>(wordIndexKey);
 	let totalTokens = 0;
 
-	for (const { path: filePath, content, mtimeMs } of files) {
+	for (const { path: filePath, content, mtimeMs, size } of files) {
 		const lines = content.split(/\r?\n/);
 		let docLength = 0;
 		const tokenLineCounts = new Map<string, number>();
@@ -203,6 +226,7 @@ export function buildWordIndex(
 		docLengths.set(filePath, docLength);
 		forward.set(filePath, tokenLineCounts);
 		fileMtimes.set(filePath, mtimeMs ?? 0);
+		fileSizes.set(filePath, size ?? Buffer.byteLength(content, "utf-8"));
 		totalTokens += docLength;
 	}
 
@@ -214,6 +238,7 @@ export function buildWordIndex(
 		truncated: files.truncated ?? false,
 		forward,
 		fileMtimes,
+		fileSizes,
 	};
 }
 
@@ -251,6 +276,7 @@ export function removeWordIndexDocument(
 	index.docLengths.delete(filePath);
 	index.forward.delete(filePath);
 	index.fileMtimes.delete(filePath);
+	index.fileSizes.delete(filePath);
 	index.totalTokens -= docLength;
 	index.docCount = Math.max(0, index.docCount - 1);
 	return true;
@@ -316,6 +342,12 @@ export function updateWordIndexDocument(
 	// legal on-disk mtime (SOURCE_DATE_EPOCH=0, archive extraction) and would
 	// collide, leaving such a file never re-tokenized (#958 review F2).
 	index.fileMtimes.set(doc.path, -1);
+	// Size is likewise recorded for the #1105 mtime+size refresh gate. The -1
+	// mtime already forces a re-read next session, so this value only keeps the
+	// map dense (parallel to fileMtimes); store the real byte length so a
+	// deserialize→reserialize round-trip before any refresh carries a truthful
+	// size rather than a placeholder.
+	index.fileSizes.set(doc.path, Buffer.byteLength(doc.content, "utf-8"));
 	index.totalTokens += docLength;
 	index.docCount += 1;
 	return true;
@@ -346,7 +378,7 @@ export async function collectWordIndexDocs(
 	root: string,
 	shouldContinue: () => boolean = () => true,
 ): Promise<
-	Array<{ path: string; content: string; mtimeMs: number }> & {
+	Array<{ path: string; content: string; mtimeMs: number; size: number }> & {
 		truncated: boolean;
 		/**
 		 * Files the walk enumerated but this pass could NOT index — unreadable
@@ -379,7 +411,12 @@ export async function collectWordIndexDocs(
 	});
 	const truncated = files.length === maxFiles;
 	const docs = Object.assign(
-		[] as Array<{ path: string; content: string; mtimeMs: number }>,
+		[] as Array<{
+			path: string;
+			content: string;
+			mtimeMs: number;
+			size: number;
+		}>,
 		{ truncated, skipped: 0 },
 	);
 	if (!shouldContinue()) return docs;
@@ -392,6 +429,7 @@ export async function collectWordIndexDocs(
 					path: file,
 					content: fs.readFileSync(file, "utf-8"),
 					mtimeMs: stat.mtimeMs,
+					size: stat.size,
 				});
 			} else {
 				// Over the byte cap — enumerated but deliberately not indexed. Count
@@ -432,7 +470,7 @@ export async function refreshWordIndexIncrementally(
 	root: string,
 	shouldContinue: () => boolean = () => true,
 ): Promise<WordIndexRefreshResult> {
-	if (!index.forward || !index.fileMtimes) {
+	if (!index.forward || !index.fileMtimes || !index.fileSizes) {
 		throw new Error("word index lacks incremental metadata");
 	}
 	const { collectSourceFilesAsync } = await import("./source-filter.js");
@@ -455,12 +493,19 @@ export async function refreshWordIndexIncrementally(
 	// strand the file with no postings. Keying `current` and `oldSet` through
 	// `wordIndexKey` keeps build/edit/refresh convergent; `current`'s value
 	// retains the raw walk path for the stat/read and for the display key.
-	const current = new Map<string, { path: string; mtimeMs: number }>();
+	const current = new Map<
+		string,
+		{ path: string; mtimeMs: number; size: number }
+	>();
 	for (const file of walked) {
 		try {
 			const stat = fs.statSync(file);
 			if (stat.size <= WORD_INDEX_MAX_BYTES) {
-				current.set(wordIndexKey(file), { path: file, mtimeMs: stat.mtimeMs });
+				current.set(wordIndexKey(file), {
+					path: file,
+					mtimeMs: stat.mtimeMs,
+					size: stat.size,
+				});
 			}
 		} catch {
 			// A file vanishing between walk and stat is simply absent.
@@ -491,8 +536,18 @@ export async function refreshWordIndexIncrementally(
 	let refreshed = 0;
 	let skipped = 0;
 	let processed = 0;
-	for (const { path: file, mtimeMs } of current.values()) {
-		if (index.fileMtimes.get(file) !== mtimeMs) {
+	for (const { path: file, mtimeMs, size } of current.values()) {
+		// #1105: mtime-first, size-second freshness — mtime alone is a stale
+		// signal (mtime-preserving content changes serve stale identifiers to
+		// symbol_search). Size is free (the stat above already read it) and
+		// catches every content change that alters byte length. Both come from the
+		// SAME stat, so a mismatch on EITHER axis re-reads. `?? -1` makes a file
+		// absent from the (possibly legacy, pre-#1105) size map always count as
+		// changed → one-time re-read that repopulates the size, the safe direction.
+		if (
+			index.fileMtimes.get(file) !== mtimeMs ||
+			(index.fileSizes.get(file) ?? -1) !== size
+		) {
 			// A file the walk/stat pass saw can still fail to read here — a
 			// transient exclusive lock (antivirus, an editor, a build step) or a
 			// file that vanished in the interim. Match collectWordIndexDocs'
@@ -509,7 +564,11 @@ export async function refreshWordIndexIncrementally(
 			if (!updateWordIndexDocument(index, { path: file, content })) {
 				throw new Error(`failed to refresh word-index document: ${file}`);
 			}
+			// updateWordIndexDocument stamps mtime=-1 (per-edit convention); the
+			// refresh path KNOWS the real on-disk stat, so overwrite both axes with
+			// the true values so this document is not needlessly re-read next pass.
 			index.fileMtimes.set(file, mtimeMs);
+			index.fileSizes.set(file, size);
 			refreshed++;
 		}
 		if (++processed % 100 === 0) {
@@ -659,6 +718,16 @@ export interface SerializedWordIndex {
 	/** Parallel to {@link files}: mtime at which each document was tokenized. */
 	fileMtimes: number[];
 	/**
+	 * Parallel to {@link files}: byte size at which each document was tokenized
+	 * (#1105, the second axis of the mtime+size refresh gate). Optional so a
+	 * pre-#1105 snapshot still parses — a missing `fileSizes` deserializes to an
+	 * empty size map, which makes every file count as size-changed on the next
+	 * refresh (one-time full re-read that repopulates sizes, the SAFE direction),
+	 * exactly how the review graph degrades to mtime-only against a pre-#202
+	 * cache. Never version-bumped for the same reason: the absence is self-healing.
+	 */
+	fileSizes?: number[];
+	/**
 	 * Forward index (#348 phase 2): `[fileIdx, [[token, lineCount], …]]` per
 	 * file. Optional so pre-phase-2 snapshots parse unchanged. When ABSENT on
 	 * load, {@link deserializeWordIndex} returns a `WordIndex` with `forward:
@@ -668,6 +737,9 @@ export interface SerializedWordIndex {
 	 */
 	forward?: Array<[number, Array<[string, number]>]>;
 }
+
+/** Persisted word-index serialization format version. Bump on breaking format changes. */
+export const WORD_INDEX_FORMAT_VERSION = 2;
 
 export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 	const files = [...index.docLengths.keys()];
@@ -694,7 +766,7 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 			: undefined;
 
 	return {
-		version: 2,
+		version: WORD_INDEX_FORMAT_VERSION,
 		files,
 		postings,
 		docLengths: files.map((file) => index.docLengths.get(file) ?? 0),
@@ -702,6 +774,7 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 		indexedFileCount: index.docCount,
 		truncated: index.truncated,
 		fileMtimes: files.map((file) => index.fileMtimes.get(file) ?? 0),
+		fileSizes: files.map((file) => index.fileSizes.get(file) ?? 0),
 		forward,
 	};
 }
@@ -711,7 +784,7 @@ export function deserializeWordIndex(
 ): WordIndex | null {
 	if (
 		!data ||
-		data.version !== 2 ||
+		data.version !== WORD_INDEX_FORMAT_VERSION ||
 		!Array.isArray(data.files) ||
 		!Array.isArray(data.postings) ||
 		!Array.isArray(data.docLengths) ||
@@ -722,8 +795,21 @@ export function deserializeWordIndex(
 	}
 	const docLengths = new PathKeyedMap<number>(wordIndexKey);
 	const fileMtimes = new PathKeyedMap<number>(wordIndexKey);
+	const fileSizes = new PathKeyedMap<number>(wordIndexKey);
 	data.files.forEach((file, i) => docLengths.set(file, data.docLengths[i] ?? 0));
 	data.files.forEach((file, i) => fileMtimes.set(file, data.fileMtimes[i] ?? 0));
+	// #1105: `fileSizes` is optional on the wire (pre-#1105 snapshots omit it).
+	// Only populate when the array is present AND parallel to `files`; otherwise
+	// leave it empty so the refresh gate re-reads every file once to repopulate,
+	// rather than trusting a bogus/misaligned size. Never treated as "current".
+	if (
+		Array.isArray(data.fileSizes) &&
+		data.fileSizes.length === data.files.length
+	) {
+		data.files.forEach((file, i) =>
+			fileSizes.set(file, data.fileSizes?.[i] ?? 0),
+		);
+	}
 
 	const postings = new Map<string, WordHit[]>();
 	for (const [token, flat] of data.postings) {
@@ -768,6 +854,7 @@ export function deserializeWordIndex(
 		truncated: data.truncated === true,
 		forward,
 		fileMtimes,
+		fileSizes,
 	};
 }
 

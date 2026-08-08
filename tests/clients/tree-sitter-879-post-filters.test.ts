@@ -171,6 +171,23 @@ describe("post-filter repairs (#879)", () => {
 		).toBe(0);
 	});
 
+	// refs #1089 P2: `\b` inside a template literal is the BACKSPACE control
+	// char, not a regex word-boundary escape, so the `resource` node text
+	// probe below could never match — every Java 9 `try (x)` short-form
+	// try-with-resources was flagged "not closed" even though it IS closed
+	// (auto-closed at the end of the try block). Only an explicit `.close()`
+	// call (covered by the test above) suppressed the finding.
+	it("recognizes Java 9 short-form try-with-resources as closing the resource", async () => {
+		expect(
+			await count(
+				"resources-closed",
+				"java",
+				"java",
+				"class T { void f() { InputStream in = open(); try (in) { use(in); } } }",
+			),
+		).toBe(0);
+	});
+
 	it("keeps direct self-recursion only when no conditional base case exists", async () => {
 		expect(
 			await count(

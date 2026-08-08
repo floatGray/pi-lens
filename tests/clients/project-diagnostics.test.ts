@@ -93,6 +93,10 @@ describe("project diagnostics cache", () => {
 	});
 
 	it("ignores stale cache versions", () => {
+		// Deliberately pinned to the literal 0, below PROJECT_DIAGNOSTICS_CACHE_VERSION,
+		// to exercise the stale-version rejection path itself (the #1082/#1106
+		// vacuous-fixture class: a future bump to 0 would silently un-exercise this).
+		expect(PROJECT_DIAGNOSTICS_CACHE_VERSION).not.toBe(0);
 		saveProjectDiagnosticsSnapshot(tmp, snapshot({ version: 0 }));
 		expect(loadProjectDiagnosticsSnapshot(tmp)).toBeUndefined();
 	});
@@ -128,6 +132,10 @@ describe("project diagnostics cache", () => {
 	});
 
 	it("ignores stale delta report versions", () => {
+		// Deliberately pinned to the literal 0, below PROJECT_DIAGNOSTICS_CACHE_VERSION,
+		// to exercise the stale-version rejection path itself (the #1082/#1106
+		// vacuous-fixture class: a future bump to 0 would silently un-exercise this).
+		expect(PROJECT_DIAGNOSTICS_CACHE_VERSION).not.toBe(0);
 		writeProjectDiagnosticsDeltaReport(tmp, deltaReport({ version: 0 }));
 		expect(loadProjectDiagnosticsDeltaReport(tmp)).toBeUndefined();
 	});

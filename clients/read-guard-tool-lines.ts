@@ -7,7 +7,13 @@ import {
 	stripBom,
 } from "./host-edit-normalize.js";
 import type { PartiallyApplicableEdit } from "./partial-edit-apply.js";
-import { logReadGuardEvent } from "./read-guard-logger.js";
+import {
+	boundedIndexesForCount,
+	createReadGuardEditBatchSummary,
+	logReadGuardEvent,
+	type EditBatchRejection,
+	type ReadGuardEditBatchSummary,
+} from "./read-guard-logger.js";
 import { isToolCallEventType } from "./tool-event.js";
 
 export interface GuardLineResult {
@@ -20,6 +26,8 @@ export interface GuardLineResult {
 	// Caller can apply these directly and return a ⚠️ PARTIAL APPLY message.
 	// Shares the host-pinned edit shape with applyPartiallyApplicableEdits.
 	partiallyApplicable?: PartiallyApplicableEdit[];
+	/** Canonical bounded edit-batch telemetry, also reused by partial apply. */
+	editBatchSummary?: ReadGuardEditBatchSummary;
 	// All edits were resolved by exact content match — range snapshot staleness
 	// is irrelevant since the content IS the edit target.
 	contentMatchValidated?: boolean;
@@ -197,6 +205,7 @@ function resolveHashlineEditInput(
 	input: Record<string, unknown>,
 	filePath: string | undefined,
 	sessionId: string | undefined,
+	correlationId?: string,
 ): GuardLineResult | undefined {
 	const operations = getHashlineOperations(input);
 	if (operations.length === 0) return undefined;
@@ -240,9 +249,21 @@ function resolveHashlineEditInput(
 	}
 
 	if (errors.length > 0) {
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes: boundedIndexesForCount(operations.length),
+			requestedTotal: operations.length,
+			rejectedReasons: boundedIndexesForCount(operations.length).map((index) => ({
+				index,
+				code: "preflight_blocked" as const,
+			})),
+			rejectedTotal: operations.length,
+			durationMs: 0,
+			terminalStatus: "blocked",
+		});
 		if (filePath) {
 			logReadGuardEvent({
 				event: "edit_preflight_blocked",
+				correlationId,
 				sessionId,
 				filePath,
 				metadata: {
@@ -254,6 +275,12 @@ function resolveHashlineEditInput(
 					errors: errors.slice(0, 10),
 				},
 			});
+			logReadGuardEvent({
+				event: "edit_batch_summary",
+				correlationId,
+				filePath,
+				metadata: { tool: "edit", editBatchSummary },
+			});
 		}
 		// Every blocking verdict ends with a single concrete next-action line so
 		// the agent recovers in one turn (#328 — uniform recovery-hint discipline).
@@ -262,6 +289,7 @@ function resolveHashlineEditInput(
 		return {
 			touchedLines: undefined,
 			preflightError: `🔴 BLOCKED — Unsupported hashline edit target\n\n${errors.join("\n")}\n\n${retryHint}`,
+			editBatchSummary,
 		};
 	}
 	if (ranges.length === 0) return undefined;
@@ -269,6 +297,7 @@ function resolveHashlineEditInput(
 	if (filePath) {
 		logReadGuardEvent({
 			event: "touched_lines_detected",
+			correlationId,
 			sessionId,
 			filePath,
 			metadata: {
@@ -369,12 +398,25 @@ function resolveOldTextEdits(
 	edits: Array<{ oldText?: string; newText?: string; originalIndex?: number }>,
 	filePath: string,
 	sessionId: string | undefined,
+	correlationId?: string,
 ): GuardLineResult {
+	const startedAt = Date.now();
+	const requestedIndexes: number[] = [];
+	const logBatchEvent = (
+		entry: Parameters<typeof logReadGuardEvent>[0],
+	): void => logReadGuardEvent({ ...entry, correlationId });
 	let rawContent: string;
 	try {
 		rawContent = nodeFs.readFileSync(filePath, "utf-8");
 	} catch {
-		logReadGuardEvent({
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes: edits.map((edit, index) => edit.originalIndex ?? index),
+			rejectedReasons: edits.map((edit, index) => ({
+				index: edit.originalIndex ?? index,
+				code: "preflight_blocked" as const,
+			})),
+		});
+		logBatchEvent({
 			event: "touched_lines_missing",
 			sessionId,
 			filePath,
@@ -384,7 +426,12 @@ function resolveOldTextEdits(
 				editCount: edits.length,
 			},
 		});
-		return { touchedLines: undefined };
+		logBatchEvent({
+			event: "edit_batch_summary",
+			filePath,
+			metadata: { tool: "edit", editBatchSummary },
+		});
+		return { touchedLines: undefined, editBatchSummary };
 	}
 
 	const rawContentLf = rawContent.replace(/\r\n/g, "\n");
@@ -393,6 +440,8 @@ function resolveOldTextEdits(
 	const failureKinds: string[] = [];
 	const failedEditIndexes: number[] = [];
 	const failedOldTextPreviews: string[] = [];
+	const rejectedReasons: EditBatchRejection[] = [];
+	const resolvedIndexes: number[] = [];
 	const resolvedRanges: [number, number][] = [];
 	const passedEdits: Array<{
 		oldText: string;
@@ -404,6 +453,7 @@ function resolveOldTextEdits(
 	for (let i = 0; i < edits.length; i++) {
 		const oldText = edits[i].oldText;
 		const editIndex = edits[i].originalIndex ?? i;
+		if (requestedIndexes.length < 100) requestedIndexes.push(editIndex);
 		if (!oldText) continue;
 
 		let needle = normalizeContent(oldText);
@@ -418,7 +468,7 @@ function resolveOldTextEdits(
 				needle = normalizeContent(corrected);
 				occurrenceLines = findOccurrenceLines(content, needle);
 				if (occurrenceLines.length > 0) {
-					logReadGuardEvent({
+					logBatchEvent({
 						event: "oldtext_indent_corrected",
 						sessionId,
 						filePath,
@@ -435,8 +485,13 @@ function resolveOldTextEdits(
 		if (occurrenceLines.length === 0) {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			failureKinds.push("oldtext_not_found");
-			failedEditIndexes.push(editIndex);
-			failedOldTextPreviews.push(preview);
+			if (failedEditIndexes.length < 100) {
+				failedEditIndexes.push(editIndex);
+				failedOldTextPreviews.push(preview);
+			}
+			if (rejectedReasons.length < 100) {
+				rejectedReasons.push({ index: editIndex, code: "oldtext_not_found" });
+			}
 			const failCount = trackOldTextFailure(filePath, preview);
 			if (failCount > maxFailCount) maxFailCount = failCount;
 			let errorMsg = `edits[${editIndex}].oldText ("${preview}") was not found in the current file content.`;
@@ -514,7 +569,7 @@ function resolveOldTextEdits(
 			// friction the host wouldn't have); false => a genuine miss. This is the
 			// measurement that tells us whether the guard earns its keep (#257).
 			const hostMatch = hostWouldApplyOldText(rawContent, oldText);
-			logReadGuardEvent({
+			logBatchEvent({
 				event: "oldtext_not_found",
 				sessionId,
 				filePath,
@@ -533,6 +588,7 @@ function resolveOldTextEdits(
 			const startLine = occurrenceLines[0];
 			const endLine = startLine + needle.split("\n").length - 1;
 			resolvedRanges.push([startLine, endLine]);
+			if (resolvedIndexes.length < 100) resolvedIndexes.push(editIndex);
 			const applyOldText = exactOldTextForApply(rawContentLf, oldText, needle);
 			if (applyOldText !== undefined) {
 				passedEdits.push({
@@ -541,7 +597,7 @@ function resolveOldTextEdits(
 					originalIndex: editIndex,
 				});
 			}
-			logReadGuardEvent({
+			logBatchEvent({
 				event: "oldtext_resolved",
 				sessionId,
 				filePath,
@@ -555,8 +611,13 @@ function resolveOldTextEdits(
 		} else {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			failureKinds.push("oldtext_duplicate");
-			failedEditIndexes.push(editIndex);
-			failedOldTextPreviews.push(preview);
+			if (failedEditIndexes.length < 100) {
+				failedEditIndexes.push(editIndex);
+				failedOldTextPreviews.push(preview);
+			}
+			if (rejectedReasons.length < 100) {
+				rejectedReasons.push({ index: editIndex, code: "oldtext_duplicate" });
+			}
 			const matchSpanLines = needle.split("\n").length;
 			const contextBlock = formatOccurrenceContext(
 				content,
@@ -566,7 +627,7 @@ function resolveOldTextEdits(
 			errors.push(
 				`edits[${editIndex}].oldText ("${preview}") appears ${occurrenceLines.length} times:\n${contextBlock}\nPick the location you want and extend your oldText with the unique line above or below it (shown as context).`,
 			);
-			logReadGuardEvent({
+			logBatchEvent({
 				event: "oldtext_duplicate",
 				sessionId,
 				filePath,
@@ -574,8 +635,8 @@ function resolveOldTextEdits(
 					tool: "edit",
 					source: "edits_without_ranges",
 					editIndex,
+					occurrenceLines: occurrenceLines.slice(0, 100),
 					occurrenceCount: occurrenceLines.length,
-					occurrenceLines,
 					oldTextPreview: preview,
 				},
 			});
@@ -591,8 +652,19 @@ function resolveOldTextEdits(
 						"One or more edit targets could not be resolved to exact lines. Re-read the relevant section and retry with the exact content as it appears in the file.",
 					];
 		const uniqueFailureKinds = [...new Set(failureKinds)];
-		logReadGuardEvent({
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes,
+			requestedTotal: edits.length,
+			resolvedIndexes,
+			resolvedTotal: resolvedRanges.length,
+			rejectedReasons,
+			rejectedTotal: Math.max(0, oldTextEditCount - resolvedRanges.length),
+			durationMs: Date.now() - startedAt,
+			terminalStatus: "blocked",
+		});
+		logBatchEvent({
 			event: "edit_preflight_blocked",
+			correlationId,
 			sessionId,
 			filePath,
 			metadata: {
@@ -620,15 +692,28 @@ function resolveOldTextEdits(
 			maxFailCount >= 2
 				? `🛑 RE-READ REQUIRED — You have submitted this oldText before and it still does not match.\n\nDo NOT retry from memory. Re-read \`${filePath}\` to get the current content, then rebuild your edit from the verbatim file text.`
 				: `🔄 RETRYABLE — Edit target not found`;
+		logBatchEvent({
+			event: "edit_batch_summary",
+			correlationId,
+			filePath,
+			metadata: { tool: "edit", editBatchSummary },
+		});
 		return {
 			touchedLines: undefined,
 			preflightError: `${header}\n\n${failureDetails.join("\n\n")}${appliedNote}`,
 			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
+			editBatchSummary,
 		};
 	}
 
 	if (resolvedRanges.length === 0) {
-		logReadGuardEvent({
+		const editBatchSummary = createReadGuardEditBatchSummary({
+			requestedIndexes,
+			requestedTotal: edits.length,
+			rejectedTotal: oldTextEditCount,
+			terminalStatus: "blocked",
+		});
+		logBatchEvent({
 			event: "touched_lines_missing",
 			sessionId,
 			filePath,
@@ -638,7 +723,12 @@ function resolveOldTextEdits(
 				editCount: edits.length,
 			},
 		});
-		return { touchedLines: undefined };
+		logBatchEvent({
+			event: "edit_batch_summary",
+			filePath,
+			metadata: { tool: "edit", editBatchSummary },
+		});
+		return { touchedLines: undefined, editBatchSummary };
 	}
 
 	const starts = resolvedRanges.map(([s]) => s);
@@ -648,7 +738,7 @@ function resolveOldTextEdits(
 		Math.max(...ends),
 	];
 	const editRanges = resolvedRanges.length > 1 ? resolvedRanges : undefined;
-	logReadGuardEvent({
+	logBatchEvent({
 		event: "touched_lines_detected",
 		sessionId,
 		filePath,
@@ -660,7 +750,20 @@ function resolveOldTextEdits(
 			totalEditCount: edits.length,
 		},
 	});
-	return { touchedLines, editRanges, contentMatchValidated: true };
+	const editBatchSummary = createReadGuardEditBatchSummary({
+		requestedIndexes,
+		requestedTotal: edits.length,
+		resolvedIndexes,
+		resolvedTotal: resolvedRanges.length,
+		durationMs: Date.now() - startedAt,
+		terminalStatus: "success",
+	});
+	return {
+		touchedLines,
+		editRanges,
+		contentMatchValidated: true,
+		editBatchSummary,
+	};
 }
 
 /**
@@ -1083,6 +1186,7 @@ export function getTouchedLinesForGuard(
 	event: unknown,
 	filePath?: string,
 	sessionId?: string,
+	correlationId?: string,
 ): GuardLineResult {
 	if (isToolCallEventType("edit", event as any)) {
 		// The host standard-edit fields (path, edits[].oldText/newText) are pinned
@@ -1110,6 +1214,7 @@ export function getTouchedLinesForGuard(
 			editInput as Record<string, unknown>,
 			filePath,
 			sessionId,
+			correlationId,
 		);
 		if (hashlineResult) return hashlineResult;
 		if (editInput.oldRange) {
@@ -1120,6 +1225,7 @@ export function getTouchedLinesForGuard(
 			if (filePath) {
 				logReadGuardEvent({
 					event: "touched_lines_detected",
+					correlationId,
 					sessionId,
 					filePath,
 					metadata: {
@@ -1150,7 +1256,12 @@ export function getTouchedLinesForGuard(
 				);
 			if (rangedEdits.length === 0) {
 				if (filePath) {
-					return resolveOldTextEdits(editInput.edits, filePath, sessionId);
+					return resolveOldTextEdits(
+						editInput.edits,
+						filePath,
+						sessionId,
+						correlationId,
+					);
 				}
 				return { touchedLines: undefined };
 			}
@@ -1161,6 +1272,7 @@ export function getTouchedLinesForGuard(
 					unresolvedOldTextEdits,
 					filePath,
 					sessionId,
+					correlationId,
 				);
 				if (resolved.preflightError) {
 					return resolved;
@@ -1188,6 +1300,7 @@ export function getTouchedLinesForGuard(
 			if (filePath) {
 				logReadGuardEvent({
 					event: "touched_lines_detected",
+					correlationId,
 					sessionId,
 					filePath,
 					metadata: {
@@ -1209,6 +1322,7 @@ export function getTouchedLinesForGuard(
 			const topLevelKeys = Object.keys(editInput as Record<string, unknown>);
 			logReadGuardEvent({
 				event: "touched_lines_missing",
+				correlationId,
 				sessionId,
 				filePath,
 				metadata: {
@@ -1235,6 +1349,7 @@ export function getTouchedLinesForGuard(
 		if (filePath) {
 			logReadGuardEvent({
 				event: "touched_lines_detected",
+				correlationId,
 				sessionId,
 				filePath,
 				metadata: {

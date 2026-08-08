@@ -1,5 +1,5 @@
 /**
- * #799: a push-only server marked `silentOnClean` (`server-strategies.ts`)
+ * #799: a push-only server marked `silentOnClean` (`wait-policy/strategies.ts`)
  * publishes NOTHING on a clean file — there is no pull fallback and (unlike
  * typescript's tsserver sync commands, `tsserver-sync.ts`) no active
  * sync-confirm protocol either, so a clean touch used to burn its FULL wait
@@ -332,7 +332,7 @@ describe("touchFile capability-aware AGGREGATE wait (#814)", () => {
 		);
 		// Both servers are silent — marksman IS tier3-silent, but typos is an
 		// ordinary push-only server (no `silentOnClean` marker in
-		// server-strategies.ts), so its silence is genuinely ambiguous and must
+		// wait-policy/strategies.ts), so its silence is genuinely ambiguous and must
 		// not be treated as confirmed-clean.
 		createLSPClient.mockImplementation(async (opts: { serverId: string }) => {
 			return makeSilentPushOnlyClient(opts.serverId, tmp).client;

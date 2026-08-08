@@ -13,7 +13,7 @@ vi.mock("../../clients/ndjson-logger.js", () => ({
 	}),
 }));
 
-import { logLatency } from "../../clients/latency-logger.js";
+import { getLastLoggedPhase, logLatency } from "../../clients/latency-logger.js";
 
 describe("latency-logger", () => {
 	beforeEach(() => {
@@ -38,5 +38,26 @@ describe("latency-logger", () => {
 				ts: expect.not.stringContaining("2000-01-01"),
 			}),
 		);
+	});
+});
+
+describe("getLastLoggedPhase (loop_block attribution, #1122/#1123)", () => {
+	it("tracks the most recent phase entry", () => {
+		logLatency({ type: "phase", phase: "graph_build", filePath: "<x>", durationMs: 5 });
+		const last = getLastLoggedPhase();
+		expect(last?.phase).toBe("graph_build");
+		expect(last?.ts).toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/));
+	});
+
+	it("does not record loop_block itself as the last phase (no self-attribution)", () => {
+		logLatency({ type: "phase", phase: "word_index_build", filePath: "<x>", durationMs: 5 });
+		logLatency({ type: "phase", phase: "loop_block", filePath: "<pi-lens>", durationMs: 9000 });
+		expect(getLastLoggedPhase()?.phase).toBe("word_index_build");
+	});
+
+	it("ignores non-phase entries", () => {
+		logLatency({ type: "phase", phase: "cascade", filePath: "<x>", durationMs: 1 });
+		logLatency({ type: "runner", filePath: "a.ts", durationMs: 1, runnerId: "biome" });
+		expect(getLastLoggedPhase()?.phase).toBe("cascade");
 	});
 });

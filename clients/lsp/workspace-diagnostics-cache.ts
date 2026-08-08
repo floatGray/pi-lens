@@ -5,6 +5,10 @@ import { readJsonCache } from "../json-cache-read.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { loadReverseDependencyIndexFromSnapshot } from "../reverse-deps.js";
 import type { LSPDiagnostic } from "./client.js";
+import {
+	createDiskBindingCache,
+	type DiagnosticBinding,
+} from "./diagnostic-binding.js";
 
 /**
  * #671: per-file cache of the last CONFIRMED `runWorkspaceDiagnostics` sweep
@@ -26,7 +30,12 @@ import type { LSPDiagnostic } from "./client.js";
  * `LSPWorkspaceDiagnosticResult.timedOut` in `./index.ts`) into
  * `WorkspaceDiagnosticsCacheEntry`.
  */
-export const WORKSPACE_DIAGNOSTICS_CACHE_VERSION = 1;
+// v2 (#1095): entries may carry an optional `contentHash` fingerprint of the
+// file bytes the cached diagnostics were computed against, so a `lookup` can
+// surface a content `binding` (boundToCurrentDisk) beyond the mtime proxy.
+// Legacy v1 entries are rejected by the version guard and re-scanned — a
+// deliberately clean break so no entry lacking the field is ever served.
+export const WORKSPACE_DIAGNOSTICS_CACHE_VERSION = 2;
 const CACHE_FILE = "lsp-workspace-diagnostics.json";
 
 export interface WorkspaceDiagnosticsCacheEntry {
@@ -61,6 +70,15 @@ export interface WorkspaceDiagnosticsCacheEntry {
 	 * identical scope.
 	 */
 	scopeKey: string;
+	/**
+	 * #1095: sha256 of the file bytes (raw UTF-8) the cached diagnostics were
+	 * computed against, when the recording call had the content in hand. Lets
+	 * `lookup` surface a content `binding` — catching the case where a file's
+	 * bytes changed but its mtime did not (the exact-mtime freshness gate would
+	 * still consider such an entry fresh). Absent when the recorder had no
+	 * content (e.g. the workspace pull sweep) → binding "unknown".
+	 */
+	contentHash?: string;
 }
 
 export interface WorkspaceDiagnosticsCache {
@@ -175,6 +193,25 @@ export function buildScopeKey(
 export interface WorkspaceDiagnosticsCacheLookup {
 	diagnostics: LSPDiagnostic[];
 	count: number;
+	/**
+	 * #1095: content binding of the cached entry — {version?, contentHash?,
+	 * boundToCurrentDisk}. `boundToCurrentDisk` is verified lazily against
+	 * current disk bytes: `false` when the recorded `contentHash` no longer
+	 * matches disk (bytes changed without an mtime bump the freshness gate would
+	 * catch), `"unknown"` when the entry has no `contentHash` (recorder had no
+	 * content) or disk is unreadable. `version` is always absent here — the
+	 * persisted cache binds by content fingerprint, not LSP document version.
+	 */
+	binding: DiagnosticBinding;
+	/**
+	 * Wall-clock time (ms) the cached diagnostics were originally scanned
+	 * (`entry.scannedAt`). A cache HIT is a replay of an OLD observation, not a
+	 * fresh one — callers reconciling this back into the footer widget must
+	 * stamp `touchedAt` with THIS value, never `Date.now()`, or a repeat check
+	 * that merely re-serves the cache would permanently disarm the widget's
+	 * mtime-staleness gate (#1093 / #1092).
+	 */
+	scannedAt: number;
 }
 
 /**
@@ -212,6 +249,10 @@ export interface WorkspaceDiagnosticsCacheContext {
 		scopeKey: string,
 		diagnostics: LSPDiagnostic[],
 		mtimeMs: number,
+		/** #1095: sha256 of the raw-UTF-8 file bytes the diagnostics were computed
+		 *  against, when the caller had content in hand. Omit when unavailable —
+		 *  the entry's binding then reads "unknown". */
+		contentHash?: string,
 	): void;
 	/** Best-effort disk write of everything recorded so far. Swallows any
 	 * write failure — a failed cache write should never fail the sweep that
@@ -235,6 +276,8 @@ export function createWorkspaceDiagnosticsCacheContext(
 		if (!reverseDepsIndex) return undefined;
 		return reverseDepsIndex.imports[cacheKeyFor(filePath)] ?? [];
 	};
+	// #1095: per-sweep disk-fingerprint memo (per file+mtime) for binding verify.
+	const diskBindingCache = createDiskBindingCache();
 	let dirty = false;
 
 	return {
@@ -242,15 +285,26 @@ export function createWorkspaceDiagnosticsCacheContext(
 			const entry = entries[cacheKeyFor(filePath)];
 			if (!entry || entry.scopeKey !== scopeKey) return undefined;
 			if (!isEntryFresh(filePath, entry, getImports)) return undefined;
-			return { diagnostics: entry.diagnostics, count: entry.count };
+			return {
+				diagnostics: entry.diagnostics,
+				count: entry.count,
+				binding: {
+					contentHash: entry.contentHash,
+					boundToCurrentDisk: diskBindingCache.boundToCurrentDisk(filePath, {
+						contentHash: entry.contentHash,
+					}),
+				},
+				scannedAt: entry.scannedAt,
+			};
 		},
-		record(filePath, scopeKey, diagnostics, mtimeMs) {
+		record(filePath, scopeKey, diagnostics, mtimeMs, contentHash) {
 			entries[cacheKeyFor(filePath)] = {
 				diagnostics,
 				count: diagnostics.length,
 				mtimeMs,
 				scannedAt: Date.now(),
 				scopeKey,
+				...(contentHash !== undefined && { contentHash }),
 			};
 			dirty = true;
 		},

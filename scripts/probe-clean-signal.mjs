@@ -68,11 +68,11 @@ process.env.PILENS_PUB_DEBUG = "1";
 const { LSP_FIXTURES } = await imp("scripts/smoke-tools.mjs");
 const { getLSPService, resetLSPService } = await imp("dist/clients/lsp/index.js");
 const { initLSPConfig } = await imp("dist/clients/lsp/config.js");
-const { SERVER_DIAGNOSTIC_STRATEGIES } = await imp("dist/clients/lsp/server-strategies.js");
+const { SERVER_DIAGNOSTIC_STRATEGIES } = await imp("dist/clients/lsp/wait-policy/strategies.js");
 let ensureTool;
 if (install) ({ ensureTool } = await imp("dist/clients/installer/index.js"));
 
-// #529/#541/#558 drift check: server-strategies.ts keys its table by SERVER
+// #529/#541/#558 drift check: wait-policy/strategies.ts keys its table by SERVER
 // ID, which usually equals the fixture's `lang`, but a few fixtures use a
 // different key (a language alias fixture, e.g. `jedi` → the "python-jedi"
 // strategy entry). Explicit map for the known deviations; anything absent
@@ -85,7 +85,7 @@ const LANG_TO_STRATEGY_KEY = {
 
 // #524/#529/#541/#558: typescript7[-clean] shares the "typescript" server id
 // with classic, but that id's `silentOnClean: true` marker is measured
-// against the CLASSIC binary only (server-strategies.ts). PR #526 originally
+// against the CLASSIC binary only (wait-policy/strategies.ts). PR #526 originally
 // excluded the native variant from the drift comparison entirely; #541
 // (2026-07-11) briefly routed it through the shared "typescript" key instead
 // after a probe run appeared to show it silent too. A 2026-07-12
@@ -313,8 +313,8 @@ const t3 = rows.filter((r) => r.behavior === "silent").length;
 const unk = rows.filter((r) => r.behavior === "unknown").length;
 
 // ---- #529/#541/#558 drift check ---------------------------------------------
-// Compare each measured server's observed behavior against server-strategies
-// .ts's `silentOnClean` marker. Telemetry only — NEVER a CI gate (this script
+// Compare each measured server's observed behavior against wait-policy
+// /strategies.ts's `silentOnClean` marker. Telemetry only — NEVER a CI gate (this script
 // always exit(0)s regardless); a mismatch is logged to stdout and written as a
 // matrix footnote so a human decides whether to flip the marker. `unknown`
 // rows are never fed in (checkCleanSignalDrift already guards this).
@@ -337,10 +337,10 @@ const driftWarnings = resolveTargetLangRows(rows)
 	.map((r) => checkCleanSignalDrift(r, lookupSilentOnClean(r.lang)))
 	.filter((d) => d.kind === "silent-not-marked" || d.kind === "marked-not-silent");
 if (driftWarnings.length) {
-	console.log(`\n  Drift vs server-strategies.ts silentOnClean marker (${driftWarnings.length} — telemetry only, never a CI gate):`);
+	console.log(`\n  Drift vs wait-policy/strategies.ts silentOnClean marker (${driftWarnings.length} — telemetry only, never a CI gate):`);
 	for (const d of driftWarnings) console.log(`    [${d.kind}] ${d.detail}`);
 } else {
-	console.log("\n  Drift vs server-strategies.ts silentOnClean marker: none.");
+	console.log("\n  Drift vs wait-policy/strategies.ts silentOnClean marker: none.");
 }
 
 // #594: also write driftWarnings as a small machine-readable JSON summary so
@@ -488,7 +488,7 @@ function writeDriftFootnote(text, warnings) {
 		heading,
 		"",
 		"Telemetry only — never a CI gate. Compares each probed server's observed",
-		"`clean-behavior` against `clients/lsp/server-strategies.ts`'s `silentOnClean`",
+		"`clean-behavior` against `clients/lsp/wait-policy/strategies.ts`'s `silentOnClean`",
 		"marker; a mismatch means the marker may need a human update (#529). `unknown`",
 		"observations are never compared (a slow/absent server is not evidence either way).",
 		"",

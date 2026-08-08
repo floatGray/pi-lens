@@ -117,7 +117,7 @@ export function classifyCleanBehavior(obs) {
 
 // ---------------------------------------------------------------------------
 // Drift check (#529): compare an OBSERVED clean-behavior classification against
-// the hand-set `silentOnClean` marker in clients/lsp/server-strategies.ts. The
+// the hand-set `silentOnClean` marker in clients/lsp/wait-policy/strategies.ts. The
 // marker is a manually-measured fact frozen in source; the probe re-measures it
 // nightly. A mismatch means either the marker is stale (a server update changed
 // its clean-scan behavior) or the marker was never set for a server that turns
@@ -128,7 +128,7 @@ export function classifyCleanBehavior(obs) {
 // `silent` vs a `publishes-*` result is comparable to the boolean marker).
 //
 // Pure (no fs/process access) so it's unit-testable without importing dist's
-// compiled server-strategies module.
+// compiled wait-policy/strategies module.
 
 /**
  * @typedef {Object} DriftInput
@@ -174,14 +174,14 @@ export function checkCleanSignalDrift(row, silentOnClean) {
     return {
       lang,
       kind: "silent-not-marked",
-      detail: `observed silent on clean transitions but server-strategies.ts has no silentOnClean marker for "${lang}" — cascade is burning the full in-lane wait it could skip (the pre-#458 situation)`,
+      detail: `observed silent on clean transitions but wait-policy/strategies.ts has no silentOnClean marker for "${lang}" — cascade is burning the full in-lane wait it could skip (the pre-#458 situation)`,
     };
   }
   if (!observedSilent && marked) {
     return {
       lang,
       kind: "marked-not-silent",
-      detail: `server-strategies.ts marks "${lang}" silentOnClean:true but this run observed ${behavior} — the marker may be stale (too pessimistic; cascade is skipping a wait the server would have resolved with a real publish)`,
+      detail: `wait-policy/strategies.ts marks "${lang}" silentOnClean:true but this run observed ${behavior} — the marker may be stale (too pessimistic; cascade is skipping a wait the server would have resolved with a real publish)`,
     };
   }
   return {

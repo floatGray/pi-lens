@@ -1,10 +1,117 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { suppressTrivyConfigDockerOverlap } from "../../../clients/dispatch/dispatcher.js";
 import {
 	looksLikeKubernetesManifest,
 	parseTrivyConfigOutput,
 } from "../../../clients/dispatch/runners/trivy-config.js";
 import type { Diagnostic } from "../../../clients/dispatch/types.js";
+
+// ── appliesTo — Terraform is in scope, Terragrunt is deliberately excluded ────
+
+describe("trivy-config appliesTo", () => {
+	it("applies to docker, yaml, and terraform, but not terragrunt", async () => {
+		const trivyConfigRunner = (
+			await import("../../../clients/dispatch/runners/trivy-config.js")
+		).default;
+		expect(trivyConfigRunner.appliesTo).toEqual(["docker", "yaml", "terraform"]);
+		expect(trivyConfigRunner.appliesTo).not.toContain("terragrunt");
+	});
+});
+
+// ── Terraform files skip the yaml/k8s content gate ─────────────────────────────
+
+const { safeSpawnAsync, isTrivyEnabled, resolveSeverityFloor } = vi.hoisted(() => ({
+	safeSpawnAsync: vi.fn(),
+	isTrivyEnabled: vi.fn(),
+	resolveSeverityFloor: vi.fn(),
+}));
+
+vi.mock("../../../clients/safe-spawn.js", () => ({
+	safeSpawnAsync,
+}));
+
+vi.mock("../../../clients/trivy-client.js", () => ({
+	isTrivyEnabled,
+	resolveSeverityFloor,
+}));
+
+vi.mock("../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
+	createAvailabilityChecker: () => ({
+		isAvailableAsync: async () => true,
+		getCommand: () => "trivy",
+	}),
+}));
+
+function createCtx(kind: "terraform" | "yaml", filePath: string, cwd: string) {
+	return {
+		filePath,
+		cwd,
+		kind,
+		pi: { getFlag: () => false },
+		autofix: false,
+		deltaMode: true,
+		hasTool: async () => true,
+		log: () => {},
+	};
+}
+
+describe("trivy-config run() — terraform pass-through", () => {
+	beforeEach(() => {
+		vi.resetModules();
+		safeSpawnAsync.mockReset();
+		isTrivyEnabled.mockReset();
+		resolveSeverityFloor.mockReset();
+		isTrivyEnabled.mockReturnValue(true);
+		resolveSeverityFloor.mockReturnValue(["HIGH", "CRITICAL"]);
+	});
+
+	it("scans a .tf file directly, without the yaml k8s-manifest gate", async () => {
+		safeSpawnAsync.mockResolvedValue({
+			error: null,
+			status: 0,
+			stdout: JSON.stringify({ Results: [] }),
+			stderr: "",
+		});
+
+		const runner = (
+			await import("../../../clients/dispatch/runners/trivy-config.js")
+		).default;
+
+		const result = await runner.run(
+			createCtx("terraform", "/tmp/main.tf", "/tmp") as never,
+		);
+
+		expect(safeSpawnAsync).toHaveBeenCalledWith(
+			"trivy",
+			expect.arrayContaining(["config", "/tmp/main.tf"]),
+			expect.objectContaining({ cwd: "/tmp" }),
+		);
+		expect(result.status).toBe("succeeded");
+	});
+
+	// trivy exits nonzero with an empty stdout when it never scanned — a bad
+	// policy bundle, an unreadable file, a rejected flag. A nonzero exit is not a
+	// spawn failure, so `result.error` is unset and an error-only guard reports a
+	// clean scan for a file trivy never read.
+	it("skips when trivy exits nonzero without producing output", async () => {
+		safeSpawnAsync.mockResolvedValue({
+			status: 1,
+			stdout: "",
+			stderr: "FATAL failed to load policies",
+		});
+
+		const runner = (
+			await import("../../../clients/dispatch/runners/trivy-config.js")
+		).default;
+
+		const result = await runner.run(
+			createCtx("terraform", "/tmp/main.tf", "/tmp") as never,
+		);
+
+		expect(result.status).toBe("skipped");
+		expect(result.diagnostics).toEqual([]);
+	});
+});
 
 // ── Kubernetes manifest heuristic ─────────────────────────────────────────────
 

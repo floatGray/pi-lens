@@ -87,6 +87,11 @@ const FUNCTION_TYPES = new Set([
 	"arrow_function",
 ]);
 
+// The same tree-sitter TypeScript integration parses both TS/TSX and the
+// JavaScript grammar. Keep this extension set local to the provider rather
+// than adding another parser or a JS-specific extraction path.
+const FUNCTION_FACT_EXTS = /\.(?:c|m)?(?:js|jsx|ts|tsx)$/i;
+
 // Decision points for McCabe complexity (matches the old ts.SyntaxKind set).
 const COMPLEXITY_TYPES = new Set([
 	"if_statement",
@@ -136,14 +141,28 @@ function getParameters(node: TsNode): TsNode[] {
 	return (fp.children ?? []).filter(
 		(c: TsNode) =>
 			c &&
-			(c.type === "required_parameter" ||
+			(c.type === "identifier" ||
+				c.type === "required_parameter" ||
 				c.type === "optional_parameter" ||
-				c.type === "rest_pattern"),
+				c.type === "rest_pattern" ||
+				c.type === "assignment_pattern" ||
+				// Plain JavaScript's grammar places a top-level destructured
+				// parameter directly as an object_pattern/array_pattern child
+				// of formal_parameters — no required_parameter wrapper (the TS
+				// grammar always wraps every parameter, destructured or not,
+				// which is why the wrapper types above already covered TS).
+				// Without this, `function f({a, b})` counted 0 params in JS
+				// while the TS-annotated equivalent counted correctly (#1089 P3-4).
+				c.type === "object_pattern" ||
+				c.type === "array_pattern"),
 	);
 }
 
 function parameterName(param: TsNode): string {
-	return firstNamedChild(param)?.text ?? "";
+	// JavaScript's grammar keeps a leaf parameter as the identifier itself;
+	// there is no named child to unwrap. TypeScript parameter wrapper nodes still
+	// use their first named child (type annotation/default/rest target).
+	return param.type === "identifier" ? param.text : firstNamedChild(param)?.text ?? "";
 }
 
 function getFunctionName(node: TsNode): string {
@@ -342,10 +361,10 @@ function hasReturnAwaitCall(node: TsNode): boolean {
 
 export const functionFactProvider: FactProvider = {
 	id: "fact.file.functions",
-	provides: ["file.functionSummaries"],
+	provides: ["file.functionSummaries", "file.functionFactsCoverage"],
 	requires: ["file.content"],
 	appliesTo(ctx) {
-		return /\.tsx?$/.test(ctx.filePath);
+		return FUNCTION_FACT_EXTS.test(ctx.filePath);
 	},
 	async run(ctx, store) {
 		await extractFactsFromTree(
@@ -410,7 +429,9 @@ export const functionFactProvider: FactProvider = {
 						node.type === "class_declaration" ||
 						node.type === "interface_declaration"
 					) {
-						const nameNode = firstChildOfType(node, "type_identifier");
+						const nameNode =
+							firstChildOfType(node, "type_identifier") ??
+							firstChildOfType(node, "identifier");
 						if (nameNode) {
 							containers.push({
 								name: nameNode.text,
@@ -432,6 +453,7 @@ export const functionFactProvider: FactProvider = {
 
 				return { "file.functionSummaries": summaries };
 			},
+			"file.functionFactsCoverage",
 		);
 	},
 };

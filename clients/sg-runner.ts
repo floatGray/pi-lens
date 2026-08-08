@@ -53,6 +53,11 @@ export interface SgMatch {
 	lines?: string;
 	language?: string;
 	replacement?: string;
+	// Present when the match came from a `scan` against a rule config (not a raw
+	// `run -p` pattern): the matched rule's id and its `severity`. Real fields of
+	// `sg scan --json` output.
+	ruleId?: string;
+	severity?: string;
 	metaVariables?: {
 		single: Record<string, SgMetaVarNode>;
 		multi: Record<string, SgMetaVarNode[]>;
@@ -129,6 +134,24 @@ function formatMetaVarCaptures(
 
 	if (parts.length === 0) return undefined;
 	return `  ${parts.join("  ")}`;
+}
+
+/**
+ * Parse ast-grep `--json` stdout into a match array, or return `null` when the
+ * text is not a match payload. ast-grep emits either a JSON array or (rarely) a
+ * single object; both are normalized to an array. A JSON scalar/`null` is
+ * rejected (returns `null`) so a hypothetical error-report scalar on stdout can
+ * never be misread as a phantom match.
+ */
+function tryParseSgMatches(stdout: string): SgMatch[] | null {
+	try {
+		const parsed = JSON.parse(stdout);
+		if (Array.isArray(parsed)) return parsed;
+		if (parsed !== null && typeof parsed === "object") return [parsed];
+		return null;
+	} catch {
+		return null;
+	}
 }
 
 export class SgRunner {
@@ -461,12 +484,28 @@ export class SgRunner {
 			};
 		}
 		if (result.status !== 0) {
+			const stdout = result.stdout.trim();
 			const stderr = result.stderr.trim();
+			// ast-grep's linter-style contract: a rule with `severity: error`
+			// that MATCHES exits 1 with valid JSON matches on stdout (stderr
+			// carries "Scan succeeded and found error level diagnostics"). An
+			// exit code that means "scan succeeded with findings" must never be
+			// classified as a CLI failure — parse the matches. Only fall through
+			// to failure when the JSON isn't parseable (a real diagnostic).
+			if (result.status === 1 && stdout && !result.outputTruncated) {
+				const matches = tryParseSgMatches(stdout);
+				if (matches) {
+					return {
+						matches,
+						totalMatches: matches.length,
+						truncated: false,
+					};
+				}
+			}
 			// ast-grep uses status 1 with no output for a genuine no-match in
 			// some CLI versions. Preserve that historical empty-result behavior;
 			// any stderr (including an invalid kind/YAML diagnostic) is a failure.
-			if (result.status === 1 && !result.stdout.trim() && !stderr)
-				return empty();
+			if (result.status === 1 && !stdout && !stderr) return empty();
 			return {
 				...empty(),
 				error: this.formatPatternError(
@@ -482,15 +521,15 @@ export class SgRunner {
 				error: "Failed to parse output: output was truncated",
 			};
 		}
-		try {
-			const parsed = JSON.parse(result.stdout);
-			const matches = Array.isArray(parsed) ? parsed : [parsed];
-			return {
-				matches,
-				totalMatches: matches.length,
-				truncated: false,
-			};
-		} catch {
+		{
+			const matches = tryParseSgMatches(result.stdout);
+			if (matches) {
+				return {
+					matches,
+					totalMatches: matches.length,
+					truncated: false,
+				};
+			}
 			return { ...empty(), error: "Failed to parse output" };
 		}
 	}
@@ -538,10 +577,23 @@ export class SgRunner {
 			};
 		}
 		if (result.status !== 0) {
+			const stdout = result.stdout.trim();
 			const stderr = result.stderr.trim();
+			// ast-grep's linter-style contract: a rule with `severity: error`
+			// that MATCHES exits 1 with valid JSON matches on stdout (stderr
+			// carries "Scan succeeded and found error level diagnostics"). An
+			// exit code that means "scan succeeded with findings" must never be
+			// classified as a CLI failure — parse the matches. Only fall through
+			// to failure when the JSON isn't parseable (a real diagnostic).
+			if (result.status === 1 && stdout && !result.outputTruncated) {
+				const matches = tryParseSgMatches(stdout);
+				if (matches) {
+					return { matches, status: result.status };
+				}
+			}
 			// Preserve ast-grep's status-1/no-output no-match convention. A
 			// diagnostic on stderr is never treated as a no-match.
-			if (result.status === 1 && !result.stdout.trim() && !stderr) {
+			if (result.status === 1 && !stdout && !stderr) {
 				return { matches: [], status: result.status };
 			}
 			return {
@@ -563,17 +615,15 @@ export class SgRunner {
 				failure: "parse-failure",
 			};
 		}
-		try {
-			const items = JSON.parse(result.stdout);
-			return {
-				matches: Array.isArray(items) ? items : [items],
-				status: result.status,
-			};
-		} catch (err) {
+		{
+			const matches = tryParseSgMatches(result.stdout);
+			if (matches) {
+				return { matches, status: result.status };
+			}
 			return {
 				matches: [],
 				status: result.status,
-				error: `Failed to parse ast-grep scan output: ${err instanceof Error ? err.message : String(err)}`,
+				error: "Failed to parse ast-grep scan output: invalid JSON",
 				failure: "parse-failure",
 			};
 		}

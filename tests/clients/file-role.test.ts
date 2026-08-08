@@ -23,4 +23,39 @@ describe("detectFileRole", () => {
 			),
 		).toBe("generated");
 	});
+
+	// Refs #1152 (latent sibling of #1150/#1151): a Windows-shaped path must
+	// classify coherently regardless of the running OS. Pre-fix,
+	// `dirname(filePath)` used the module-default (POSIX on Linux); a
+	// backslash-only Windows path has no `/` for POSIX `dirname` to find, so
+	// it collapsed to `"."` and the `/tests/` dir-branch below never matched
+	// — misclassifying a test file under `tests\` as "source" on Linux, even
+	// though the byte-identical forward-slash form ("C:/proj/tests/foo.ts")
+	// already classified correctly (POSIX `dirname` handles forward slashes
+	// fine regardless of the leading drive letter). This test is meaningful
+	// on BOTH OSes per the #1024 discipline: on native Windows it exercises
+	// the (unchanged, already-correct) win32 `dirname`/`basename` path; on
+	// Linux it exercises the new shape-committed `win32.dirname`/`basename`
+	// branch that this fix adds — pre-fix, the backslash case below FAILED
+	// on Linux (classified "source" instead of "test") while the
+	// forward-slash case already passed.
+	it("classifies a Windows-shaped path's test directory coherently across separator styles, even off native Windows", () => {
+		for (const filePath of [
+			"C:\\proj\\tests\\foo.ts",
+			"C:/proj/tests/foo.ts",
+			"C:\\proj\\src\\foo.test.ts",
+			"\\\\server\\share\\tests\\foo.ts",
+		]) {
+			expect(detectFileRole(filePath)).toBe("test");
+		}
+	});
+
+	it("still resolves index/init role for a Windows-shaped path (basename shape-coherence)", () => {
+		expect(detectFileRole("C:\\proj\\src\\index.ts")).toBe("init");
+	});
+
+	it("does not misclassify a native POSIX path as Windows-shaped (no regression for the common case)", () => {
+		expect(detectFileRole("/home/dev/project/tests/foo.ts")).toBe("test");
+		expect(detectFileRole("/home/dev/project/src/foo.ts")).toBe("source");
+	});
 });

@@ -17,7 +17,7 @@ import { readJsonCacheAsync } from "./json-cache-read.js";
 import type { PersistedReadGuardState } from "./read-guard.js";
 import type { PersistedWidgetState } from "./widget-state.js";
 
-const STATE_VERSION = 1;
+export const STATE_VERSION = 1;
 
 export interface PersistedSessionState {
 	version: number;

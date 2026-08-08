@@ -117,7 +117,19 @@ describe("killProcessTree", () => {
 		});
 
 		it("non-fast shutdown escalates SIGTERM → SIGKILL on the process group", async () => {
-			const proc = { kill: vi.fn(() => true), unref: vi.fn() };
+			// #1114 follow-up: this mock must be `once`-capable so the
+			// escalation logic's real gate (an observed "exit" event, not the
+			// unreachable `proc.killed` send-flag) is actually exercised —
+			// without `.once`, `proc.once?.(...)` optional-chains to a no-op
+			// and the "exited" flag can never be set from true code changes,
+			// making the assertions below pass vacuously regardless of
+			// whether the escalation logic is correct.
+			const proc = {
+				kill: vi.fn(() => true),
+				unref: vi.fn(),
+				once: vi.fn(),
+				off: vi.fn(),
+			};
 			const done = killProcessTree(proc, 4242, {});
 
 			expect(processKillSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
@@ -127,6 +139,55 @@ describe("killProcessTree", () => {
 			await done;
 
 			expect(processKillSpy).toHaveBeenCalledWith(-4242, "SIGKILL");
+		});
+
+		// #1114 follow-up (adversarial review of PR #1130): the pre-existing
+		// tests above use mocks that lack `.once`/never set `.killed`, so both
+		// the pre-fix `!proc.killed` guard AND the post-fix `!exited` guard
+		// were vacuously permissive there — neither test could actually catch
+		// a regression in the escalation logic. These two tests use an
+		// `.once`-capable mock that captures the real "exit" listener the fix
+		// registers, and assert BOTH directions of the `fast`-shutdown
+		// escalation timer (client.ts's `killProcessTree`, `options.fast`
+		// branch): no premature SIGKILL when the process is observed to exit
+		// within the window, and a real SIGKILL when it isn't.
+		it("fast shutdown SIGKILLs the process group when no exit is observed by the 1.5s window", async () => {
+			const proc = {
+				kill: vi.fn(() => true),
+				unref: vi.fn(),
+				once: vi.fn(),
+				off: vi.fn(),
+			};
+			await killProcessTree(proc, 4242, { fast: true });
+
+			expect(processKillSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
+			expect(processKillSpy).not.toHaveBeenCalledWith(-4242, "SIGKILL");
+
+			await vi.advanceTimersByTimeAsync(1500);
+
+			expect(processKillSpy).toHaveBeenCalledWith(-4242, "SIGKILL");
+		});
+
+		it("fast shutdown skips the group SIGKILL when the process's exit is observed before the 1.5s window", async () => {
+			let exitListener: (() => void) | undefined;
+			const proc = {
+				kill: vi.fn(() => true),
+				unref: vi.fn(),
+				once: vi.fn((event: string, listener: () => void) => {
+					if (event === "exit") exitListener = listener;
+				}),
+				off: vi.fn(),
+			};
+			await killProcessTree(proc, 4242, { fast: true });
+
+			expect(processKillSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
+			expect(exitListener).toBeDefined();
+
+			// The process dies well inside the escalation window.
+			exitListener?.();
+			await vi.advanceTimersByTimeAsync(1500);
+
+			expect(processKillSpy).not.toHaveBeenCalledWith(-4242, "SIGKILL");
 		});
 
 		it("resolves on the process's exit event without waiting out the escalation window", async () => {

@@ -15,6 +15,22 @@ const sharedExclude = [
 	"**/.claude/**",
 ];
 
+// The two slow real-process files `npm run test:integration` runs on their own.
+// `npm run test:unit` is the complement, and the switch has to live here: every
+// project below sets its own `exclude`, which REPLACES the root/CLI value
+// outright, so a `vitest run --exclude <file>` on the command line is silently
+// ignored (it was, from #1101 until 2026-08-06). npm exports the script name it
+// is running, and that survives the with-test-lock wrapper identically on every
+// OS — unlike an inline `FOO=1 …` prefix, which cmd.exe cannot parse.
+// `test:integration` names these same two files positionally in package.json
+// (a positional filter DOES survive) — keep the two lists in step.
+const integrationInclude = [
+	"tests/index-integration.test.ts",
+	"tests/clients/lsp/integration.test.ts",
+];
+const unitOnlyExclude =
+	process.env.npm_lifecycle_event === "test:unit" ? integrationInclude : [];
+
 const sharedGlobalSetup = [
 	"./tests/support/check-build-freshness.ts",
 	"./tests/support/prewarm-grammars.ts",
@@ -75,6 +91,11 @@ const grammarHeavyInclude = [
 	"tests/clients/review-graph/tsconfig-paths.test.ts",
 	"tests/clients/review-graph/extract-symbols.test.ts",
 	"tests/clients/project-diagnostics/scanner.test.ts",
+	// #1089: these two co-load most of the grammar set (incl. the heavy
+	// swift/cpp/kotlin/csharp four) for the call-graph fixture matrices —
+	// the exact #255/#902 contention shape this project exists to bound.
+	"tests/clients/tree-sitter-call-graph.test.ts",
+	"tests/clients/module-report-call-graph.test.ts",
 ];
 
 // Tier 2 fix (#902): event-loop *occupancy* guards (measureMaxSyncBlockMs —
@@ -101,6 +122,10 @@ const grammarHeavyInclude = [
 const timingSensitiveInclude = [
 	"tests/clients/source-walk-occupancy.test.ts",
 	"tests/clients/source-filter-async.test.ts",
+	// Workspace-edit planning also uses the independent occupancy sampler; keep
+	// its measurement window out of the default fork storm while the guard still
+	// catches a genuinely non-yielding planner.
+	"tests/clients/lsp/edits.test.ts",
 	// Same measureMaxSyncBlockMs sampler + same contention-starvation flake
 	// (observed 2026-07-31: cold buildOrUpdateGraph blew the 300ms budget at
 	// ~82s under a full-suite fork storm, exhausting its retry:2). Its
@@ -147,6 +172,7 @@ export default defineConfig({
 					name: "default",
 					exclude: [
 						...sharedExclude,
+						...unitOnlyExclude,
 						...grammarHeavyInclude,
 						...timingSensitiveInclude,
 						...lspSpawnHeavyInclude,

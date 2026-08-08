@@ -109,4 +109,32 @@ describe("taplo runner", () => {
 			env.cleanup();
 		}
 	});
+
+	// taplo exits nonzero with an empty stdout when it never linted — a rejected
+	// flag, an unreadable schema. A nonzero exit is not a spawn failure, so
+	// `result.error` is unset and an error-only guard reports a clean file.
+	it("skips when taplo exits nonzero without producing output", async () => {
+		const env = setupTestEnvironment("pi-lens-taplo-");
+		try {
+			const filePath = path.join(env.tmpDir, "config.toml");
+			fs.writeFileSync(filePath, "a = 1\n");
+			safeSpawn.mockReturnValue({
+				error: null,
+				status: 1,
+				stdout: "",
+				stderr: "error: invalid schema reference",
+			});
+
+			const runner = (
+				await import("../../../../clients/dispatch/runners/taplo.js")
+			).default;
+
+			const result = await runner.run(createTomlCtx(filePath, env.tmpDir) as never);
+
+			expect(result.status).toBe("skipped");
+			expect(result.diagnostics).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
 });

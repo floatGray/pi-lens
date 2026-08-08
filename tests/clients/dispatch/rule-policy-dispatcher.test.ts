@@ -554,6 +554,36 @@ describe("dispatcher filter — delta baseline integrity", () => {
 		expect(second.resolvedCount).toBe(0);
 	});
 
+	it("does not count an inline-suppressed finding as resolved on repeat dispatches (#1087)", async () => {
+		// "Silencing is not fixing" is a CLASS invariant, not just the policy
+		// member. A finding persistently dropped by an inline `pi-lens-ignore`
+		// comment must be filtered out of BOTH sides of the delta — otherwise it
+		// sits in `fixed` on every dispatch and inflates trackAgentFixed forever.
+		// No `.pi-lens.json` policy here: the suppression is the inline comment.
+		const facts = new FactStore();
+		const filePath = path.join(tmpDir, "a.ts");
+		// no-eval fires on line 1 and is suppressed there; no-debugger on line 2.
+		const content =
+			"doEval(y); // pi-lens-ignore: no-eval\nconst y = 1;\n";
+
+		facts.setFileFact(filePath, "file.content", content);
+		const first = await dispatchForFile(
+			makeContext(tmpDir, facts),
+			groups,
+			registryFor(policyDiagnostics()),
+		);
+		// The inline-suppressed rule is absent from the very first render.
+		expect(first.diagnostics.map((d) => d.rule)).toEqual(["no-debugger"]);
+
+		facts.setFileFact(filePath, "file.content", content);
+		const second = await dispatchForFile(
+			makeContext(tmpDir, facts),
+			groups,
+			registryFor(policyDiagnostics()),
+		);
+		expect(second.resolvedCount).toBe(0);
+	});
+
 	it("still counts a genuinely fixed rule as resolved", async () => {
 		// Guards the fix from over-correcting: a rule that stops firing and is
 		// NOT policy-dropped must still land in `fixed`.

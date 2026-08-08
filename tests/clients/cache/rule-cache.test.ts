@@ -252,6 +252,9 @@ describe("RuleCache", () => {
 		expect(fs.existsSync(cacheFile)).toBe(true);
 
 		const raw = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
+		// Pin (#1082/#1116 pattern): the runtime constant must never coincide with
+		// this deliberate mismatch literal, or this test would vacuously pass.
+		expect(CACHE_VERSION).not.toBe("v2");
 		raw.version = "v2";
 		fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
 

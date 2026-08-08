@@ -232,12 +232,22 @@ const HEARTBEAT_SAMPLE_TIMEOUT_MS = 2000;
  *  a timeout resolves to `{}` (same "leave everything untouched" semantics as
  *  any other sampling failure — see the module docstring below). */
 async function buildHeartbeatResourcePatchBounded(): Promise<HeartbeatPatch> {
-	return Promise.race([
-		buildHeartbeatResourcePatch(),
-		new Promise<HeartbeatPatch>((resolve) =>
-			setTimeout(() => resolve({}), HEARTBEAT_SAMPLE_TIMEOUT_MS),
-		),
-	]);
+	// #1097: clear the timeout once the race settles. An uncleared, REF'D
+	// setTimeout would keep the event loop alive for the full
+	// HEARTBEAT_SAMPLE_TIMEOUT_MS after `agent_settled` fires the quiet window —
+	// a same-class sibling of the LSP client-wait leak: harmless in a long-lived
+	// session, but a keep-alive tail in a one-shot `pi --print` process.
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			buildHeartbeatResourcePatch(),
+			new Promise<HeartbeatPatch>((resolve) => {
+				timer = setTimeout(() => resolve({}), HEARTBEAT_SAMPLE_TIMEOUT_MS);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
 
 /**

@@ -6,8 +6,9 @@
  * files, no logic-density checks on re-export barrels).
  */
 
-import { basename, dirname } from "node:path";
+import { basename, dirname, win32 } from "node:path";
 import { isGeneratedOrArtifact } from "./generated-artifacts.js";
+import { isWindowsPath } from "./path-utils.js";
 
 // --- Types ---
 
@@ -65,10 +66,24 @@ function isTypeStub(content: string): boolean {
 /**
  * Classify the structural role of a file. Pass `content` for higher
  * accuracy (enables generated-code detection, barrel detection, etc.).
+ *
+ * `detectFileRole` is platform-native by design — normal same-OS paths
+ * (POSIX on Linux, win32 on Windows) go through the module-default
+ * `basename`/`dirname`, unchanged from before. But a WINDOWS-SHAPED path
+ * (drive letter or UNC prefix, per `isWindowsPath`) is parsed with
+ * `path.win32.basename`/`dirname` regardless of the running OS (refs #1152,
+ * the #1150 class): on Linux the module-default `dirname` finds no `/` in a
+ * `C:\...` path, collapses to `"."`, and the dir-based branches below
+ * (`/tests/`, `/spec/`, …) silently misclassify. On win32 this branch is a
+ * no-op — `win32.basename`/`dirname` already equal the module default there
+ * — so native Windows classification is unchanged.
  */
 export function detectFileRole(filePath: string, content?: string): FileRole {
-	const base = basename(filePath).toLowerCase();
-	const dir = dirname(filePath).replace(/\\/g, "/").toLowerCase();
+	const windowsShaped = isWindowsPath(filePath);
+	const base = (windowsShaped ? win32.basename(filePath) : basename(filePath)).toLowerCase();
+	const dir = (windowsShaped ? win32.dirname(filePath) : dirname(filePath))
+		.replace(/\\/g, "/")
+		.toLowerCase();
 
 	// --- Test ---
 	if (

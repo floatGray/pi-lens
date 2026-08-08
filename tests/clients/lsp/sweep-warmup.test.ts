@@ -141,7 +141,7 @@ describe("LSPService.ensureWarmForSweep (#667)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
-		// typescript's real strategy aggregateWaitMs is 1000ms (server-strategies.ts)
+		// typescript's real strategy aggregateWaitMs is 1000ms (wait-policy/strategies.ts)
 		// — far below the 20000ms warm-up budget requested here. Before the fix,
 		// `perServerTimeout`'s `Math.min(callerCap, strategyWait)` silently capped
 		// the actual `waitForDiagnostics` call at 1000ms regardless of what was
@@ -265,7 +265,7 @@ describe("runWorkspaceDiagnostics sweep-level warm-up behavior (#667)", () => {
  * `failedServerIds` and its files are skipped for the rest of the sweep and
  * reported UNCONFIRMED (not confirmed-clean).
  *
- * #799: marksman itself is now `silentOnClean: true` (`server-strategies.ts`)
+ * #799: marksman itself is now `silentOnClean: true` (`wait-policy/strategies.ts`)
  * — a real timeout for it (no publish, notify succeeded) is CONFIRMED clean,
  * not a failed warm-up (see `silent-clean-confirm.test.ts`). These "genuinely
  * still cold" tests use a fictitious server id (`workspace-indexer-generic`,

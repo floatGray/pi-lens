@@ -42,6 +42,7 @@ export type FileKind =
 	| "sql" // SQL
 	| "swift" // Swift
 	| "terraform" // Terraform
+	| "terragrunt" // Terragrunt
 	| "toml" // TOML
 	| "yaml" // YAML
 	| "zig" // Zig
@@ -212,6 +213,7 @@ export const KIND_EXTENSIONS: Record<FileKind, readonly string[]> = {
 		".tf",
 		".tfvars",
 	],
+	terragrunt: [],
 	toml: [
 		".toml",
 	],
@@ -246,6 +248,20 @@ export const DOTNET_FSHARP_ROOT_MARKERS: readonly string[] = [
 	"*.sln",
 ];
 
+/**
+ * Terragrunt's unit/root entrypoint filenames, lowercase. Single source of truth
+ * for every subsystem that has to agree on what counts as a terragrunt file —
+ * SPECIAL_FILENAMES below, tool-policy.ts's linter and formatter policies,
+ * formatters.ts's terragruntHclFormatter, and language-profile.ts's project/root
+ * markers. Same rule as the .NET markers above: never hand-copy this list at a
+ * call site. tests/clients/terragrunt-filenames.test.ts asserts every consumer
+ * honors every name here, so a drifting call site fails CI.
+ */
+export const TERRAGRUNT_FILENAMES: readonly string[] = [
+	"terragrunt.hcl",
+	"root.hcl",
+];
+
 // Reverse map: extension → file kind (for fast lookup)
 const EXT_TO_KIND = new Map<string, FileKind>();
 for (const [kind, exts] of Object.entries(KIND_EXTENSIONS)) {
@@ -265,6 +281,10 @@ const SPECIAL_FILENAMES: Array<{ pattern: RegExp; kind: FileKind }> = [
 	{ pattern: /^CMakeLists\.txt$/i, kind: "cmake" },
 	{ pattern: /^Makefile$/i, kind: "shell" },
 	{ pattern: /^Dockerfile(\.\w+)?$/i, kind: "docker" },
+	...TERRAGRUNT_FILENAMES.map((name) => ({
+		pattern: new RegExp(`^${name.replaceAll(".", "\\.")}$`, "i"),
+		kind: "terragrunt" as FileKind,
+	})),
 ];
 
 // --- Detection Functions ---
@@ -369,6 +389,7 @@ export const CODE_KINDS: ReadonlySet<FileKind> = new Set<FileKind>([
 	"sql",
 	"swift",
 	"terraform",
+	"terragrunt",
 	"zig",
 ]);
 
@@ -445,6 +466,7 @@ export function getFileKindLabel(kind: FileKind): string {
 		ocaml: "OCaml",
 		clojure: "Clojure",
 		terraform: "Terraform",
+		terragrunt: "Terragrunt",
 		nix: "Nix",
 		toml: "TOML",
 	};
@@ -519,6 +541,7 @@ export function getLanguageId(kind: FileKind): string {
 		ocaml: "ocaml",
 		clojure: "clojure",
 		terraform: "terraform",
+		terragrunt: "terragrunt",
 		nix: "nix",
 		toml: "toml",
 	};

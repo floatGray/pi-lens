@@ -53,11 +53,20 @@ const {
  * with `code`, all on the microtask queue so `await`-ing the sampler flushes
  * them. `emitError: true` fires an "error" event instead of closing normally.
  */
+interface FakeChild {
+	stdout: {
+		on: (event: string, cb: (chunk: Buffer) => void) => void;
+		unref: ReturnType<typeof vi.fn>;
+	};
+	once: (event: string, cb: (...a: unknown[]) => void) => void;
+	unref: ReturnType<typeof vi.fn>;
+}
+
 function makeFakeChild(opts: {
 	stdout?: string;
 	code?: number;
 	emitError?: boolean;
-}): unknown {
+}): FakeChild {
 	const handlers = new Map<string, (...a: unknown[]) => void>();
 	const dataCbs: Array<(chunk: Buffer) => void> = [];
 	const child = {
@@ -65,10 +74,12 @@ function makeFakeChild(opts: {
 			on: (event: string, cb: (chunk: Buffer) => void) => {
 				if (event === "data") dataCbs.push(cb);
 			},
+			unref: vi.fn(),
 		},
 		once: (event: string, cb: (...a: unknown[]) => void) => {
 			handlers.set(event, cb);
 		},
+		unref: vi.fn(),
 	};
 	queueMicrotask(() => {
 		if (opts.emitError) {
@@ -303,6 +314,64 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 		const result = await sampleProcesses([]);
 		expect(result.size).toBe(0);
 		expect(spy).not.toHaveBeenCalled();
+	});
+});
+
+describe("resource-sampler: fire-and-forget CIM spawns are unref'd (#1155)", () => {
+	// Mirrors tests/clients/instance-reaper-unref.test.ts's shape (#1153/#1160):
+	// a piped, `data`-listener-attached child re-references the libuv loop even
+	// after `child.unref()` unless its stdout pipe is unref'd too — this module
+	// has TWO such spawns (sampleProcessesWindows's CIM query, and
+	// findDescendantPidsWindows's descendant-tree CIM query used by
+	// startSpawnUsageSampler on Windows), and both must be unref'd.
+	beforeEach(() => {
+		pidusageMock.mockReset();
+		__resetWindowsCpuHistoryForTests();
+		setPlatform("win32");
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("sampleProcesses (sampleProcessesWindows) unrefs its CIM child + stdout", async () => {
+		const spawned: ReturnType<typeof makeFakeChild>[] = [];
+		fakeSpawn = () => {
+			const child = makeFakeChild({ stdout: "111,4096,0,0\r\n", code: 0 });
+			spawned.push(child);
+			return child;
+		};
+
+		await sampleProcesses([111]);
+
+		expect(spawned.length).toBeGreaterThanOrEqual(1);
+		for (const child of spawned) {
+			expect(child.unref).toHaveBeenCalled();
+			expect(child.stdout.unref).toHaveBeenCalled();
+		}
+	});
+
+	it("startSpawnUsageSampler (findDescendantPidsWindows) unrefs its CIM child + stdout", async () => {
+		vi.useFakeTimers();
+		const spawned: ReturnType<typeof makeFakeChild>[] = [];
+		fakeSpawn = () => {
+			// Every call here is the descendant-lookup query (pid,parentPid CSV) —
+			// empty output resolves to no descendants, which is fine; the point is
+			// only to observe the spawned child's unref calls.
+			const child = makeFakeChild({ stdout: "", code: 0 });
+			spawned.push(child);
+			return child;
+		};
+
+		const sampler = startSpawnUsageSampler(999, 100);
+		await vi.advanceTimersByTimeAsync(0); // flush the immediate tick
+		sampler.stop();
+
+		expect(spawned.length).toBeGreaterThanOrEqual(1);
+		for (const child of spawned) {
+			expect(child.unref).toHaveBeenCalled();
+			expect(child.stdout.unref).toHaveBeenCalled();
+		}
 	});
 });
 

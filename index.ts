@@ -69,8 +69,26 @@ import {
 } from "./clients/instance-reaper.js";
 import {
 	deregisterInstance,
+	readInstanceRegistry,
 	registerInstance,
 } from "./clients/instance-registry.js";
+import { logVanishedInstances } from "./clients/vanished-instance-marker.js";
+import {
+	buildMemorySample,
+	formatMemoryHealthLine,
+	shouldEmitMemorySample,
+} from "./clients/memory-sampler.js";
+import { dumpActiveHandles } from "./clients/debug-handles.js";
+import {
+	isDebugHeapEnabled,
+	writeHeapSnapshotNow,
+} from "./clients/debug-heap.js";
+import {
+	checkSmellsAndNoteOnce,
+	countRecentSmells,
+	formatSmellsHealthLine,
+	shouldCheckSmellsThisTurn,
+} from "./clients/smells-rollup.js";
 import { configureWarmAttach } from "./clients/warm-attach.js";
 import { checkCrossProcessLspBudget } from "./clients/lsp-budget.js";
 import { handleAgentEnd } from "./clients/runtime-agent-end.js";
@@ -120,7 +138,7 @@ import {
 } from "./tools/module-report.js";
 import { createProjectReportTool } from "./tools/project-report.js";
 import { createSymbolSearchTool } from "./tools/symbol-search.js";
-import { logLatency } from "./clients/latency-logger.js";
+import { getLastLoggedPhase, logLatency } from "./clients/latency-logger.js";
 import {
 	clearCachePrefixSession,
 	logCacheUsage,
@@ -141,6 +159,7 @@ import {
 import { renderTurnSummaryMessage } from "./clients/turn-summary-render.js";
 import {
 	getEventLoopStats,
+	resetEventLoopMonitor,
 	shouldLogWorstBlock,
 	startEventLoopMonitor,
 } from "./clients/event-loop-monitor.js";
@@ -155,8 +174,18 @@ const PI_LENS_EVAL_MS = getPiLensEvalMs() ?? 0;
 // blocks are captured. Native histogram — no per-event overhead. (#192)
 startEventLoopMonitor();
 // Worst event-loop block already persisted to latency.log (so we only log a
-// *new* worst freeze per turn, not the same growing max). (#192)
+// *new* worst freeze per turn, not the same growing max). (#192) A suspected
+// system stall (sleep/paging) never advances this high-water, so a machine
+// freeze can't permanently suppress logging of later genuine blocks. (#1122)
 let lastLoggedLoopWorstMs = 0;
+// Worst *genuine* (non-stall) block this session, for the health readout — the
+// per-turn histogram window (#1122) is reset each turn, so the session-scoped
+// worst is tracked here instead of read from the live histogram.
+let sessionWorstRealBlockMs = 0;
+// How many turns logged a suspected system stall (sleep/paging) this session —
+// surfaced in /lens-health so a machine freeze reads as environment, not a
+// pi-lens block (#1122).
+let sessionSuspectedStalls = 0;
 
 function dbg(msg: string) {
 	logSessionStart(msg);
@@ -766,18 +795,61 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			// Event-loop occupancy — the dimension our duration logs were blind to
-			// (#192). `maxMs` ≈ the worst synchronous block (TUI stall) this session.
+			// (#192). The histogram window is now per-turn (#1122), so the session
+			// worst genuine (non-stall) block is tracked separately; p99/mean here
+			// reflect the current turn window.
 			const elStats = getEventLoopStats();
 			if (elStats) {
 				lines.push(
 					"",
-					`Event loop (session): worst block ${elStats.maxMs}ms · p99 ${elStats.p99Ms}ms · mean ${elStats.meanMs}ms`,
+					`Event loop: worst genuine block ${sessionWorstRealBlockMs}ms (session) · p99 ${elStats.p99Ms}ms · mean ${elStats.meanMs}ms (turn)`,
 				);
-				if (elStats.maxMs > 100) {
+				if (sessionWorstRealBlockMs > 100) {
 					lines.push(
 						"  ⚠ a >100ms synchronous block can stutter the TUI — check latency.log (#192)",
 					);
 				}
+				if (sessionSuspectedStalls > 0) {
+					lines.push(
+						`  ${sessionSuspectedStalls} suspected system stall(s) (sleep/paging) this session — excluded from the block figure above (#1122)`,
+					);
+				}
+			}
+
+			// Memory attribution (#1123 item 2) — reuses the same O(1) accessors the
+			// periodic latency.log `memory_sample` uses; see clients/memory-sampler.ts.
+			try {
+				lines.push("", formatMemoryHealthLine(buildMemorySample(runtime.wordIndex)));
+			} catch {
+				// best-effort — a health-line render must never break /lens-health
+			}
+
+			// On-demand heap snapshot (#1126) — the retainer-attribution half of the
+			// memory line above: it says how many bytes are resident by subsystem,
+			// this captures WHICH objects retain them. Gated behind PI_LENS_DEBUG_HEAP
+			// (zero cost + no file when unset) and only ever triggered from this
+			// operator-invoked diagnostics command — never a hot path or timer, so the
+			// synchronous multi-second snapshot pause is opt-in and explicit. See
+			// clients/debug-heap.ts.
+			if (isDebugHeapEnabled()) {
+				try {
+					const snap = writeHeapSnapshotNow("lens_health");
+					if (snap) {
+						lines.push(
+							`Heap snapshot written: ${snap.path} (RSS ${Math.round(snap.rssBytes / (1024 * 1024))}MB, ${snap.durationMs}ms) — open in Chrome DevTools › Memory`,
+						);
+					}
+				} catch {
+					// best-effort — a snapshot write must never break /lens-health
+				}
+			}
+
+			// Smells self-surfacing (#1123 item 3) — same bounded tail-scan the
+			// session_start line and turn_end note use; see clients/smells-rollup.ts.
+			try {
+				lines.push(formatSmellsHealthLine(countRecentSmells()));
+			} catch {
+				// best-effort — a health-line render must never break /lens-health
 			}
 
 			if (diagStats.repeatOffenders.length > 0) {
@@ -1045,7 +1117,12 @@ export default function (pi: ExtensionAPI) {
 		createAstGrepReplaceTool(astGrepClient),
 		createAstGrepOutlineTool(astGrepClient),
 		createAstGrepDumpTool(astGrepClient),
-		createLspNavigationTool((name) => getLensFlag(name)),
+		createLspNavigationTool((name, cwd) => getLensFlag(name, cwd), {
+			runtime,
+			cacheManager,
+			readGuard: runtime.readGuard,
+			dbg,
+		}),
 		createLensDiagnosticMarkTool(() => runtime.projectRoot),
 	];
 	const LAZY_TOOL_CATALOG: ActivatableToolInfo[] = [
@@ -1217,7 +1294,21 @@ export default function (pi: ExtensionAPI) {
 			void registerInstance(ctx.cwd ?? process.cwd()).catch(() => {
 				// best-effort observability — never fail session_start over this
 			});
-			void sweepOrphans();
+			// #1123 item 2: log a sessionstart.log marker for any registry entry
+			// whose owning pid is confirmed dead — this instance vanished without
+			// reaching deregisterInstance()'s clean-shutdown removal. MUST read the
+			// registry and log BEFORE sweepOrphans (below) prunes exactly these same
+			// dead-pid entries out from under it, or the vanished set would already
+			// be empty by the time this runs — hence the explicit read here rather
+			// than letting sweepOrphans's own internal read race it.
+			void readInstanceRegistry()
+				.then((registry) => logVanishedInstances(registry))
+				.catch(() => {
+					// best-effort observability — never fail session_start over this
+				})
+				.finally(() => {
+					void sweepOrphans();
+				});
 			// #658: registry-INDEPENDENT backstop sweep, running alongside the
 			// registry-driven one above. `sweepOrphans` can only ever see pids
 			// still listed in some instance's `lspChildren[]`; once that trace is
@@ -1632,17 +1723,79 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const repaintLspStatus = captureLspStatusRepaint(ctx);
 			// Persist a new worst event-loop block to latency.log, attributed to
-			// this turn, so freezes are queryable across sessions (#192).
-			const loopMaxMs = getEventLoopStats()?.maxMs ?? 0;
+			// this turn, so freezes are queryable across sessions (#192). The
+			// window is per-turn (#1122): the probe cannot itself see machine
+			// sleep or commit-charge paging, both of which freeze the process and
+			// masquerade as huge synchronous blocks, so we tag samples the turn's
+			// CPU budget can't account for as `suspectSystemStall` and keep them
+			// out of the genuine-block high-waters. `lastPhase` is cheap block
+			// attribution (#1123 item 1) — the last phase that ran before the
+			// block was detected.
+			const elStats = getEventLoopStats();
+			const loopMaxMs = elStats?.maxMs ?? 0;
+			const suspectSystemStall = elStats?.suspectSystemStall ?? false;
 			if (shouldLogWorstBlock(loopMaxMs, lastLoggedLoopWorstMs)) {
+				const lastPhase = getLastLoggedPhase();
 				logLatency({
 					type: "phase",
 					filePath: "<pi-lens>",
 					phase: "loop_block",
 					durationMs: Math.round(loopMaxMs),
-					metadata: { worstSoFar: true, turnIndex: runtime.turnIndex },
+					metadata: {
+						worstSoFar: true,
+						turnIndex: runtime.turnIndex,
+						suspectSystemStall,
+						windowCpuMs: elStats?.windowCpuMs,
+						windowWallMs: elStats?.windowWallMs,
+						lastPhase: lastPhase?.phase,
+						lastPhaseAt: lastPhase?.ts,
+					},
 				});
-				lastLoggedLoopWorstMs = loopMaxMs;
+				// A system stall must not raise the "new worst genuine block"
+				// bar, or it would silence every real block that follows it.
+				if (suspectSystemStall) {
+					sessionSuspectedStalls += 1;
+				} else {
+					lastLoggedLoopWorstMs = loopMaxMs;
+					sessionWorstRealBlockMs = Math.max(sessionWorstRealBlockMs, loopMaxMs);
+				}
+			}
+			// Start a fresh per-turn occupancy window so the next turn's worst
+			// block is attributable to that turn and its CPU budget is measured
+			// over the same span (#1122).
+			resetEventLoopMonitor();
+
+			// #1123 item 2: periodic memory-attribution sample, every
+			// MEMORY_SAMPLE_TURN_INTERVAL turns — cheap (O(1)/O(bounded-cache-size)
+			// reads only, see clients/memory-sampler.ts) so no extra throttling is
+			// needed beyond the turn cadence itself.
+			if (shouldEmitMemorySample(runtime.turnIndex)) {
+				try {
+					const sample = buildMemorySample(runtime.wordIndex);
+					logLatency({
+						type: "phase",
+						filePath: "<pi-lens>",
+						phase: "memory_sample",
+						durationMs: 0,
+						metadata: { turnIndex: runtime.turnIndex, ...sample },
+					});
+				} catch {
+					// best-effort observability — never fail turn_end over this
+				}
+			}
+
+			// #1123 item 3: bounded smells re-check, same cadence style as the memory
+			// sample above — at most once per SMELLS_TURN_CHECK_INTERVAL turns, and
+			// each smell notifies at most once per session (checkSmellsAndNoteOnce's
+			// gate). See clients/smells-rollup.ts for the tail-scan cost bound.
+			if (shouldCheckSmellsThisTurn(runtime.turnIndex)) {
+				try {
+					for (const note of checkSmellsAndNoteOnce(countRecentSmells())) {
+						ctx.ui.notify(note, "warning");
+					}
+				} catch {
+					// best-effort observability — never fail turn_end over this
+				}
 			}
 
 			// Drain any tool_result still in the debounce window so turn_end
@@ -1886,6 +2039,11 @@ export default function (pi: ExtensionAPI) {
 				}).catch((err) => {
 					dbg(`quiet_window crashed: ${err}`);
 				});
+				// #1123 item 4: dump active handles AFTER the quiet-window work is
+				// scheduled — the #1097-class leak (a stray ref'd timer surviving
+				// past settle) is only visible once whatever settle itself queued is
+				// already in flight. No-op unless PI_LENS_DEBUG_HANDLES=1.
+				dumpActiveHandles("agent_settled");
 			},
 		);
 	} catch (registerErr) {
@@ -1944,6 +2102,11 @@ export default function (pi: ExtensionAPI) {
 			processExiting: true,
 			reason: "session_shutdown",
 		});
+		// #1123 item 4: dump active handles AFTER teardown — whatever is still
+		// alive at this point is exactly what would keep a --print/--no-session
+		// process from exiting (the #1097 lesson: what survives IS the leak).
+		// No-op unless PI_LENS_DEBUG_HANDLES=1.
+		dumpActiveHandles("session_shutdown");
 	});
 
 	// --- Prompt-cache response-side usage observability (#1018) ---

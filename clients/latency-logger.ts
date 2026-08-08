@@ -42,11 +42,35 @@ export interface LatencyEntry {
 	metadata?: Record<string, unknown>;
 }
 
+/**
+ * Most recent non-`loop_block` phase seen by `logLatency`, for cheap block
+ * attribution (#1122 / #1123 item 1): the event-loop-block probe fires at
+ * turn_end and cannot see *what* stalled the loop, so it stamps the last phase
+ * that ran as a starting point for root-causing a genuine block. Tracked before
+ * the test-mode guard so it is deterministic and unit-testable.
+ */
+let lastPhase: { phase: string; ts: string } | undefined;
+
+/**
+ * The last non-`loop_block` phase logged, or undefined if none yet. Carries its
+ * own `ts` so a consumer can gauge staleness: it is intentionally NOT cleared at
+ * turn/window boundaries, so on a turn that logged no phase of its own it may
+ * point at a prior turn's phase — compare `ts` against the block time before
+ * trusting it as the cause (it is a breadcrumb, not proof).
+ */
+export function getLastLoggedPhase(): { phase: string; ts: string } | undefined {
+	return lastPhase;
+}
+
 export function logLatency(entry: LatencyEntry): void {
+	const ts = new Date().toISOString();
+	if (entry.type === "phase" && entry.phase && entry.phase !== "loop_block") {
+		lastPhase = { phase: entry.phase, ts };
+	}
 	if (isTestMode()) {
 		return;
 	}
-	writer.log({ ...entry, ts: new Date().toISOString(), pid: process.pid });
+	writer.log({ ...entry, ts, pid: process.pid });
 }
 
 export function getLatencyLogPath(): string {

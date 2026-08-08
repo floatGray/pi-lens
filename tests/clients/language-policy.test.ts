@@ -141,7 +141,13 @@ describe("language-policy", () => {
 		expect(cxx?.runnerIds).toEqual(["cpp-check"]);
 
 		const terraform = getPrimaryDispatchGroup("terraform", true);
-		expect(terraform?.runnerIds).toEqual(["lsp", "tflint"]);
+		expect(terraform?.runnerIds).toEqual(["lsp", "tflint", "trivy-config"]);
+
+		const terragrunt = getPrimaryDispatchGroup("terragrunt", true);
+		expect(terragrunt?.runnerIds).toEqual(["terragrunt"]);
+
+		const terragruntNoLsp = getPrimaryDispatchGroup("terragrunt", false);
+		expect(terragruntNoLsp?.runnerIds).toEqual(["terragrunt"]);
 
 		const kotlin = getPrimaryDispatchGroup("kotlin", false);
 		expect(kotlin?.runnerIds).toEqual(["ktlint"]);

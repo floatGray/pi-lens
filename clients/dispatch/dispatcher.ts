@@ -762,39 +762,9 @@ export async function dispatchForFile(
 	// Apply delta mode ONCE across the full diagnostic set.
 	// This avoids partial-baseline corruption when processing multiple groups.
 	const dedupedDiagnostics = dedupeOverlappingDiagnostics(allDiagnostics);
-	const dockerOverlapSuppressed =
-		suppressTrivyConfigDockerOverlap(dedupedDiagnostics);
-	const overlapSuppressed = suppressLintOverlapsWithLsp(dockerOverlapSuppressed);
 	const fileContent =
 		ctx.facts.getFileFact<string>(ctx.filePath, "file.content") ?? "";
-	const inlineSuppressed = applyInlineSuppressions(
-		overlapSuppressed,
-		fileContent,
-	);
-	// #690: agent/user disposition layer — drop false-positive/suppress marks
-	// and anything deferred this session. flagged marks are left in place;
-	// lens_diagnostics tags them at render time via the same anchor.
-	//
-	// #1030: anchor + store MUST key off the PROJECT ROOT, not ctx.cwd. In a
-	// monorepo ctx.cwd is the nested language root (resolveLanguageRootForFile,
-	// used for tool/config resolution), but the mark tool writes dispositions
-	// under runtime.projectRoot. Keying the read on ctx.cwd computed a different
-	// anchor AND opened a different diagnostic-dispositions.json (getProjectDataDir
-	// is keyed on cwd), so every false-positive/flagged/defer on a file under a
-	// nested marker silently no-op'd. Read from the project root to match the write.
-	const dispositionFiltered = applyDispositions(
-		inlineSuppressed,
-		ctx.projectRoot ?? ctx.cwd,
-		ctx.filePath,
-		fileContent,
-	);
-	// Project rule policy (`.pi-lens.json` `rules.<id>.disable`/`select`) —
-	// output-only filtering applied AFTER inline suppression / disposition so
-	// the project's policy overlays the same set the renderer would see, but
-	// BEFORE widget state / baseline-related processing. The baseline below
-	// still uses `dedupedDiagnostics` (the unfiltered set), so editing a
-	// project's policy doesn't reset / corrupt delta baselines — the
-	// user-authored baseline comparison remains authoritative.
+	// Project rule policy (`.pi-lens.json` `rules.<id>.disable`/`select`).
 	//
 	// Resolved from `ctx.projectRoot` (falling back to `ctx.cwd`), NOT
 	// `ctx.projectConfig` — `ctx.projectConfig` is loaded from the nested
@@ -808,18 +778,50 @@ export async function dispatchForFile(
 	const rulePolicy = rulePolicyMapFromConfig(
 		loadPiLensProjectConfig(ctx.projectRoot ?? ctx.cwd).rules,
 	);
-	const policyKept = applyRulePolicy(dispositionFiltered, rulePolicy);
-	let visibleDiagnostics = policyKept;
+	// The output-only filter pipeline: LSP/docker overlap suppression + inline
+	// `pi-lens-ignore` + agent/user dispositions + project rule policy. Applied
+	// AFTER dedupe so the pi renderer, widget, and delta all see one filtered
+	// set. #690: dispositions drop false-positive/suppress marks and anything
+	// deferred this session (flagged marks stay; lens_diagnostics tags them at
+	// render time). #1030: the disposition anchor + store MUST key off the
+	// PROJECT ROOT, not ctx.cwd — the mark tool writes dispositions under
+	// runtime.projectRoot, so reading from ctx.cwd (the nested language root in
+	// a monorepo) opened a different diagnostic-dispositions.json and silently
+	// no-op'd every mark under a nested marker.
+	//
+	// #1087: "silencing is not fixing" applies to the WHOLE class, not just the
+	// policy member. This single pipeline is applied identically to the live set
+	// AND (below) to the delta baseline, so a finding persistently dropped by
+	// ANY layer — overlap, inline suppression, disposition, or policy — is
+	// absent from both sides of the delta and never oscillates into `fixed`
+	// (which `trackAgentFixed` would otherwise inflate forever). The stored
+	// baseline remains the unfiltered `dedupedDiagnostics`, so editing a
+	// project's policy/suppressions never resets or corrupts the user-authored
+	// delta baseline — the filtering is re-derived on read for both sides.
+	const applyOutputFilters = (diags: Diagnostic[]): Diagnostic[] => {
+		const dockerOverlap = suppressTrivyConfigDockerOverlap(diags);
+		const overlap = suppressLintOverlapsWithLsp(dockerOverlap);
+		const inline = applyInlineSuppressions(overlap, fileContent);
+		const disposition = applyDispositions(
+			inline,
+			ctx.projectRoot ?? ctx.cwd,
+			ctx.filePath,
+			fileContent,
+		);
+		return applyRulePolicy(disposition, rulePolicy);
+	};
+	let visibleDiagnostics = applyOutputFilters(dedupedDiagnostics);
 	let resolvedCount = 0;
 	if (ctx.deltaMode && previousBaseline) {
 		// Silencing a rule is not fixing it. The stored baseline is deliberately
-		// unfiltered (below), so compare against a policy-filtered view of it —
-		// otherwise every disabled finding sits in `fixed` on every dispatch and
-		// inflates the agent's resolved tally (trackAgentFixed) forever. Only
-		// `fixed` changes: policy-dropped ids are absent from `after` either way.
+		// unfiltered (below), so compare against a fully-filtered view of it
+		// through the SAME pipeline — otherwise every persistently-suppressed
+		// finding sits in `fixed` on every dispatch and inflates the agent's
+		// resolved tally (trackAgentFixed) forever. Only `fixed` changes:
+		// filtered-out ids are absent from `after` either way.
 		const filtered = filterDelta(
 			visibleDiagnostics,
-			applyRulePolicy(previousBaseline, rulePolicy),
+			applyOutputFilters(previousBaseline),
 			(d) => d.id,
 		);
 		visibleDiagnostics = promoteDeltaUnusedToBlockers(filtered.new);

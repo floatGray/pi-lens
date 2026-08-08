@@ -25,6 +25,7 @@ import {
 	WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
 	type WorkspaceDiagnosticsCacheEntry,
 } from "../../../clients/lsp/workspace-diagnostics-cache.js";
+import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 let tmp: string;
@@ -179,7 +180,14 @@ describe("WorkspaceDiagnosticsCacheContext (#671)", () => {
 		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
 		const mtimeMs = fs.statSync(filePath).mtimeMs;
 		ctx.record(filePath, "all|", [], mtimeMs);
-		expect(ctx.lookup(filePath, "all|")).toEqual({ diagnostics: [], count: 0 });
+		// #1093: lookup surfaces the entry's original `scannedAt` so a cache-hit
+		// footer reconcile can stamp `touchedAt` at observation time. #1095: it also
+		// surfaces the content `binding`.
+		expect(ctx.lookup(filePath, "all|")).toMatchObject({
+			diagnostics: [],
+			count: 0,
+			scannedAt: expect.any(Number),
+		});
 	});
 
 	it("a lookup under a DIFFERENT scopeKey never sees an entry recorded under another scope", () => {
@@ -211,10 +219,61 @@ describe("WorkspaceDiagnosticsCacheContext (#671)", () => {
 		first.persist();
 
 		const second = createWorkspaceDiagnosticsCacheContext(tmp);
-		expect(second.lookup(filePath, "all|")).toEqual({
+		expect(second.lookup(filePath, "all|")).toMatchObject({
 			diagnostics: diag,
 			count: 1,
+			scannedAt: expect.any(Number),
 		});
+	});
+
+	// #1095: the lookup surfaces a content binding — a recorded fingerprint lets a
+	// later lookup verify against disk beyond the mtime proxy.
+	it("lookup binding is 'unknown' for an entry recorded without a contentHash", () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const a = 1;\n");
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.record(filePath, "all|", [], fs.statSync(filePath).mtimeMs);
+		expect(ctx.lookup(filePath, "all|")?.binding.boundToCurrentDisk).toBe(
+			"unknown",
+		);
+	});
+
+	it("lookup binding is 'true' when the recorded contentHash matches current disk bytes", () => {
+		const filePath = path.join(tmp, "a.ts");
+		const content = "const a = 1;\n";
+		fs.writeFileSync(filePath, content);
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		ctx.record(
+			filePath,
+			"all|",
+			[],
+			fs.statSync(filePath).mtimeMs,
+			hashDiagnosticContent(content),
+		);
+		expect(ctx.lookup(filePath, "all|")?.binding.boundToCurrentDisk).toBe(true);
+	});
+
+	it("lookup binding is 'false' when the recorded contentHash does not match current disk (content check beats mtime)", () => {
+		const filePath = path.join(tmp, "a.ts");
+		const onDisk = "const a = 1;\n";
+		fs.writeFileSync(filePath, onDisk);
+		const mtimeMs = fs.statSync(filePath).mtimeMs;
+		const ctx = createWorkspaceDiagnosticsCacheContext(tmp);
+		// Record at the CURRENT mtime (so the exact-mtime freshness gate passes) but
+		// with a fingerprint of DIFFERENT bytes — modelling a file whose content
+		// diverged from what the cached diagnostics were computed against without an
+		// mtime bump the freshness gate would otherwise catch. The binding is then
+		// the only signal that catches the divergence.
+		ctx.record(
+			filePath,
+			"all|",
+			[],
+			mtimeMs,
+			hashDiagnosticContent("const a = 999;\n"),
+		);
+		const hit = ctx.lookup(filePath, "all|");
+		expect(hit).toBeDefined();
+		expect(hit?.binding.boundToCurrentDisk).toBe(false);
 	});
 
 	it("persist() is a no-op (never throws, never writes) when nothing was recorded", () => {
@@ -360,5 +419,48 @@ describe("runWorkspaceDiagnostics cache integration (#671)", () => {
 		// two unchanged files were served from cache again.
 		expect(waitCalls.length).toBe(callsAfterFirstSweep + 1);
 		expect(waitCalls[waitCalls.length - 1]?.filePath).toBe(changed);
+	});
+
+	// #1095 (P2-1): the SERVICE sweep must apply the same content-binding gate the
+	// tools/lsp-diagnostics.ts sibling site does — both share cache entries under
+	// the same scopeKey, so a hash-bearing entry whose bytes diverged WITHOUT an
+	// mtime bump (exactly what contentHash exists to catch) must not be replayed as
+	// confirmed via mode=full.
+	it("does NOT serve a cached entry whose contentHash mismatches disk under a matching mtime (P2-1 binding gate)", async () => {
+		const file = path.join(tmpSweep, "a.ts");
+		fs.writeFileSync(file, "const z = 1;\n");
+		const mtimeMs = fs.statSync(file).mtimeMs;
+		// Pre-seed a v2 cache entry under the SERVICE sweep scope with a fingerprint
+		// of DIFFERENT bytes but the CURRENT mtime: the exact-mtime freshness gate
+		// passes, so only the content binding can catch the divergence.
+		const scopeKey = buildScopeKey("all", ["opengrep"]);
+		saveWorkspaceDiagnosticsCache(tmpSweep, {
+			version: WORKSPACE_DIAGNOSTICS_CACHE_VERSION,
+			entries: {
+				[cacheKeyFor(file)]: {
+					diagnostics: [],
+					count: 0,
+					mtimeMs,
+					scannedAt: Date.now(),
+					scopeKey,
+					contentHash: hashDiagnosticContent("const z = 999;\n"),
+				},
+			},
+		});
+
+		const tsServer = makeTsServer(tmpSweep);
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith(".ts") ? [tsServer] : [],
+		);
+		const { client, waitCalls } = makeFakeClient(tmpSweep);
+		createLSPClient.mockResolvedValue(client);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		await service.runWorkspaceDiagnostics(tmpSweep);
+		// The mismatched entry was NOT served — a.ts (the only file) fell through to
+		// a fresh touch. A served cache hit would have produced zero wait calls.
+		expect(waitCalls.length).toBeGreaterThan(0);
 	});
 });

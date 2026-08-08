@@ -452,6 +452,21 @@ export async function safeSpawnAsync(
 		let aborted = false;
 		let killed = false;
 		let outputTruncated = false;
+		// #1109: the non-Windows SIGTERM→SIGKILL escalation timer (armed in
+		// killTree below). Stored per-call (never shared) so the close/error
+		// handlers can clear it if the child exits before it fires — same
+		// uncleared-race-timeout class as the LSP client-wait leak (#1097):
+		// a ref'd 1s timer that outlives the child it was escalating against
+		// would keep a one-shot `pi --print` process alive for up to 1s.
+		let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+		// #1114: `child.killed` is set by Node the moment `kill()` successfully
+		// SENDS a signal, not when the child actually dies — so gating the
+		// escalation on `!child.killed` right after a successful `SIGTERM` send
+		// is always false and the SIGKILL branch is unreachable. Track observed
+		// death via the close/error handlers instead (set synchronously, before
+		// any `await`, so a timer firing during the close handler's `await
+		// killPromise` still observes the flag correctly).
+		let closed = false;
 		const maxOutputBytes =
 			options?.maxOutputBytes !== undefined &&
 			Number.isFinite(options.maxOutputBytes) &&
@@ -622,8 +637,8 @@ export async function safeSpawnAsync(
 				}
 			} else {
 				child.kill("SIGTERM");
-				setTimeout(() => {
-					if (!child.killed) child.kill("SIGKILL");
+				escalationTimer = setTimeout(() => {
+					if (!closed) child.kill("SIGKILL");
 				}, 1000);
 			}
 		};
@@ -695,10 +710,15 @@ export async function safeSpawnAsync(
 
 		// Process completion
 		child.on("close", async (code, signal) => {
+			closed = true;
 			clearTimeout(timeoutId);
 			abortSignal?.removeEventListener("abort", onAbort);
 			if (child.pid) lifetimeState.pids.delete(child.pid);
 			await killPromise;
+			// #1109: the child has exited — if killTree armed the non-Windows
+			// SIGTERM→SIGKILL escalation timer and it hasn't fired yet, clear it
+			// so it doesn't linger as a ref'd handle after this promise resolves.
+			if (escalationTimer) clearTimeout(escalationTimer);
 			const resourceUsage = finishResourceUsage();
 
 			const outputInfo = outputTruncated ? { outputTruncated: true } : {};
@@ -740,8 +760,10 @@ export async function safeSpawnAsync(
 		});
 
 		child.on("error", (err) => {
+			closed = true;
 			clearTimeout(timeoutId);
 			abortSignal?.removeEventListener("abort", onAbort);
+			if (escalationTimer) clearTimeout(escalationTimer);
 			if (child.pid) lifetimeState.pids.delete(child.pid);
 			const resourceUsage = finishResourceUsage();
 			let failure: SpawnFailureKind = "spawn";

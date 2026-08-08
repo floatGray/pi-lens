@@ -34,7 +34,7 @@ export function buildDriftIssueBody(summary, opts = {}) {
   const lines = [
     "Auto-filed/updated by the nightly `tool-smoke` workflow's `probe-clean-signal.mjs` step (#529/#594).",
     "",
-    "This is **telemetry only** — the probe never gates CI. It compares each measured LSP server's observed clean-scan behavior against the hand-set `silentOnClean` marker in `clients/lsp/server-strategies.ts`; a mismatch here means a human should consider updating that marker (or investigating why the server's observed behavior changed).",
+    "This is **telemetry only** — the probe never gates CI. It compares each measured LSP server's observed clean-scan behavior against the hand-set `silentOnClean` marker in `clients/lsp/wait-policy/strategies.ts`; a mismatch here means a human should consider updating that marker (or investigating why the server's observed behavior changed).",
     "",
     `Last observed: ${summary?.generatedAt ?? "unknown"} (${count} finding${count === 1 ? "" : "s"})`,
     "",

@@ -62,6 +62,19 @@ describe("applyInlineSuppressions (#442 — shared by mode=all + mode=full)", ()
 		).toEqual([]);
 	});
 
+	// #1087 P3-1: the COMMENT token is now normalized too, not just the
+	// diagnostic id. Previously a language-suffixed comment token (`no-eval-js`)
+	// failed to suppress a finding surfaced under the normalized bare id
+	// (`no-eval`), even though the identical `disable: ["no-eval-js"]` config key
+	// worked (rule-policy normalizes both sides). The two surfaces are now
+	// symmetric.
+	it("suppresses via a language-suffixed comment token against a normalized id (#1087)", () => {
+		const content = "eval(x)  # pi-lens-ignore: no-eval-js\n";
+		expect(
+			applyInlineSuppressions([{ line: 1, rule: "no-eval" }], content),
+		).toEqual([]);
+	});
+
 	it("is a no-op when there are no ignore comments", () => {
 		const content = "eval(x)\nalert(1)\n";
 		const diags: D[] = [{ line: 1, rule: "no-eval" }];

@@ -17,7 +17,7 @@
  */
 
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { logLatency } from "../../../clients/latency-logger.js";
 
@@ -109,5 +109,58 @@ describe("LSP client — crash exit is logged, not silently swallowed", () => {
 			([entry]) => entry?.phase === "lsp_server_unexpected_exit",
 		);
 		expect(hit).toBeUndefined();
+	}, 10_000);
+
+	it("closeDocument sends didClose and clears document lifecycle state", async () => {
+		const { createLSPClient } = await import("../../../clients/lsp/client.js");
+		const { launchLSP } = await import("../../../clients/lsp/launch.js");
+		const filePath = path.join(process.cwd(), "client-close-document.ts");
+		const fileUri = pathToFileURL(filePath).href;
+
+		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			cwd: process.cwd(),
+		});
+		client = await createLSPClient({
+			serverId: "fake",
+			process: proc,
+			root: process.cwd(),
+		});
+		const sendNotification = vi.spyOn(client.connection, "sendNotification");
+
+		await client.notify.open(filePath, "const broken = true;", "typescript", false, true);
+		await client.notify.change(filePath, "const changed = true;");
+		await client.waitForDiagnostics(filePath, 1_000, { pullOnly: true });
+		expect(client.isDocumentOpen(filePath)).toBe(true);
+		expect(client.getDiagnostics(filePath)).toHaveLength(1);
+		expect(client.getTrackedDiagnosticPaths()).toContain(filePath);
+
+		await client.closeDocument(filePath);
+
+		expect(sendNotification).toHaveBeenCalledWith("textDocument/didClose", {
+			textDocument: { uri: fileUri },
+		});
+		expect(client.isDocumentOpen(filePath)).toBe(false);
+		expect(client.getDiagnostics(filePath)).toEqual([]);
+		expect(client.getTrackedDiagnosticPaths()).not.toContain(filePath);
+
+		await client.notify.open(filePath, "const reopened = true;", "typescript", false, true);
+		const reopenCalls = sendNotification.mock.calls.filter(
+			([method]) => method === "textDocument/didOpen",
+		);
+		const reopen = reopenCalls[reopenCalls.length - 1];
+		expect(reopen?.[1]).toMatchObject({
+			textDocument: { uri: fileUri, version: 0 },
+		});
+
+		await client.closeDocument(filePath);
+		const closeCount = sendNotification.mock.calls.filter(
+			([method]) => method === "textDocument/didClose",
+		).length;
+		await client.closeDocument(filePath);
+		expect(
+			sendNotification.mock.calls.filter(
+				([method]) => method === "textDocument/didClose",
+			).length,
+		).toBe(closeCount);
 	}, 10_000);
 });

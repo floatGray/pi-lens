@@ -75,11 +75,23 @@ export interface DirWalkPolicy {
  * The one shared "should this directory be walked into" decision. Every
  * caller's own loop still owns *when* to call this (inline recursion vs. a
  * stack) and what to do with the answer.
+ *
+ * `onGeneratedDirSkip` (#1107 phase 2) fires exactly once when — and only
+ * when — the `isGeneratedArtifactDirectoryName` branch is the reason this
+ * directory is pruned, so a caller can count PRUNED DIRECTORIES (one event
+ * per directory, regardless of how many files it contains) without
+ * enumerating the directory's contents — doing that would defeat the whole
+ * point of pruning it. Optional and unused by every caller except
+ * `source-filter.ts`'s `classifyEntry`: the other two `shouldRecurseIntoDir`
+ * callers (`language-profile.ts`, `startup-scan.ts`) always pass
+ * `skipGeneratedArtifactDirs: false`, so this branch — and therefore the
+ * callback — never fires for them.
  */
 export function shouldRecurseIntoDir(
 	entry: fs.Dirent,
 	fullPath: string,
 	policy: DirWalkPolicy,
+	onGeneratedDirSkip?: () => void,
 ): boolean {
 	if (isExcludedDirName(entry.name, policy.extraExcludeDirs ?? [])) {
 		return false;
@@ -89,6 +101,7 @@ export function shouldRecurseIntoDir(
 		policy.skipGeneratedArtifactDirs === true &&
 		isGeneratedArtifactDirectoryName(entry.name)
 	) {
+		onGeneratedDirSkip?.();
 		return false;
 	}
 	if (policy.followSymlinks !== true && entry.isSymbolicLink()) return false;

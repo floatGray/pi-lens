@@ -51,8 +51,12 @@ function handle(raw) {
 		return;
 	}
 
-	// Initialize handshake
+	// Initialize handshake. FAKE_LSP_IGNORE_INITIALIZE simulates a hung server
+	// that never completes the handshake, so createLSPClient's
+	// initializeTimeoutMs/withTimeout fires and exercises the initialize-
+	// timeout kill + 2s SIGKILL-backstop path (#1114).
 	if (data.method === "initialize") {
+		if (process.env.FAKE_LSP_IGNORE_INITIALIZE === "1") return;
 		send({
 			jsonrpc: "2.0",
 			id: data.id,
